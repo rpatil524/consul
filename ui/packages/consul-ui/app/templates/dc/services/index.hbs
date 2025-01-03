@@ -1,3 +1,8 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
 <Route
   @name={{routeName}}
 as |route|>
@@ -96,6 +101,7 @@ as |sort filters items partition nspace|}}
           <Consul::Service::List
             @items={{collection.items}}
             @partition={{partition}}
+            @nspace={{nspace}}
           >
           </Consul::Service::List>
         </collection.Collection>
@@ -113,25 +119,28 @@ as |sort filters items partition nspace|}}
               <BlockSlot @name="body">
                 {{t 'routes.dc.services.index.empty.body'
                   items=items.length
+                  canUseACLs=(can "use acls")
                   htmlSafe=true
                 }}
               </BlockSlot>
               <BlockSlot @name="actions">
-                <li class="docs-link">
-                  <Action
+                <li>
+                  <Hds::Link::Standalone
+                    @text='Documentation on Services'
                     @href="{{env 'CONSUL_DOCS_URL'}}/commands/services"
-                    @external={{true}}
-                  >
-                    Documentation on Services
-                  </Action>
+                    @icon='docs-link'
+                    @iconPosition='trailing'
+                    @size='small'
+                  />
                 </li>
-                <li class="learn-link">
-                  <Action
+                <li>
+                  <Hds::Link::Standalone
+                    @text='Take the tutorial'
                     @href="{{env 'CONSUL_DOCS_LEARN_URL'}}/consul/getting-started/services"
-                    @external={{true}}
-                  >
-                    Take the tutorial
-                  </Action>
+                    @icon='learn-link'
+                    @iconPosition='trailing'
+                    @size='small'
+                  />
                 </li>
               </BlockSlot>
             </EmptyState>

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package dataplane
 
 import (
@@ -7,32 +10,45 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	acl "github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/go-hclog"
+
+	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/agent/configentry"
 	"github.com/hashicorp/consul/agent/consul/state"
 	external "github.com/hashicorp/consul/agent/grpc-external"
-	structs "github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/agent/xds/accesslogs"
 	"github.com/hashicorp/consul/proto-public/pbdataplane"
 )
 
 func (s *Server) GetEnvoyBootstrapParams(ctx context.Context, req *pbdataplane.GetEnvoyBootstrapParamsRequest) (*pbdataplane.GetEnvoyBootstrapParamsResponse, error) {
-	logger := s.Logger.Named("get-envoy-bootstrap-params").With("service_id", req.GetServiceId(), "request_id", external.TraceID())
+	proxyID := req.ProxyId
+	if req.GetServiceId() != "" {
+		proxyID = req.GetServiceId()
+	}
+	logger := s.Logger.Named("get-envoy-bootstrap-params").With("proxy_id", proxyID, "request_id", external.TraceID())
 
 	logger.Trace("Started processing request")
 	defer logger.Trace("Finished processing request")
 
-	token := external.TokenFromContext(ctx)
+	options, err := external.QueryOptionsFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var authzContext acl.AuthorizerContext
 	entMeta := acl.NewEnterpriseMetaWithPartition(req.GetPartition(), req.GetNamespace())
-	authz, err := s.ACLResolver.ResolveTokenAndDefaultMeta(token, &entMeta, &authzContext)
+	authz, err := s.ACLResolver.ResolveTokenAndDefaultMeta(options.Token, &entMeta, &authzContext)
 	if err != nil {
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}
 
 	store := s.GetStore()
 
-	_, svc, err := store.ServiceNode(req.GetNodeId(), req.GetNodeName(), req.GetServiceId(), &entMeta, structs.DefaultPeerKeyword)
+	_, svc, err := store.ServiceNode(req.GetNodeId(), req.GetNodeName(), proxyID, &entMeta, structs.DefaultPeerKeyword)
 	if err != nil {
 		logger.Error("Error looking up service", "error", err)
 		if errors.Is(err, state.ErrNodeNotFound) {
@@ -51,38 +67,68 @@ func (s *Server) GetEnvoyBootstrapParams(ctx context.Context, req *pbdataplane.G
 		return nil, status.Error(codes.PermissionDenied, err.Error())
 	}
 
-	// Build out the response
-
-	resp := &pbdataplane.GetEnvoyBootstrapParamsResponse{
-		Service:     svc.ServiceProxy.DestinationServiceName,
-		Partition:   svc.EnterpriseMeta.PartitionOrDefault(),
-		Namespace:   svc.EnterpriseMeta.NamespaceOrDefault(),
-		Datacenter:  s.Datacenter,
-		ServiceKind: convertToResponseServiceKind(svc.ServiceKind),
+	_, ns, err := configentry.MergeNodeServiceWithCentralConfig(
+		nil,
+		store,
+		svc.ToNodeService(),
+		logger,
+	)
+	if err != nil {
+		logger.Error("Error merging with central config", "error", err)
+		return nil, status.Errorf(codes.Unknown, "Error merging central config: %v", err)
 	}
 
-	bootstrapConfig, err := structpb.NewStruct(svc.ServiceProxy.Config)
+	bootstrapConfig, err := structpb.NewStruct(ns.Proxy.Config)
 	if err != nil {
 		logger.Error("Error creating the envoy boostrap params config", "error", err)
 		return nil, status.Error(codes.Unknown, "Error creating the envoy boostrap params config")
 	}
-	resp.Config = bootstrapConfig
 
-	return resp, nil
+	// Inspect access logging
+	// This is non-essential, and don't want to return an error unless there is a more serious issue
+	var accessLogs []string
+	if ns != nil {
+		accessLogs = makeAccessLogs(&ns.Proxy.AccessLogs, logger)
+	}
+
+	// Build out the response
+	var serviceName string
+	if svc.ServiceKind == structs.ServiceKindConnectProxy {
+		serviceName = svc.ServiceProxy.DestinationServiceName
+	} else {
+		serviceName = svc.ServiceName
+	}
+
+	return &pbdataplane.GetEnvoyBootstrapParamsResponse{
+		Identity:   serviceName,
+		Service:    serviceName,
+		Partition:  svc.EnterpriseMeta.PartitionOrDefault(),
+		Namespace:  svc.EnterpriseMeta.NamespaceOrDefault(),
+		Config:     bootstrapConfig,
+		Datacenter: s.Datacenter,
+		NodeName:   svc.Node,
+		AccessLogs: accessLogs,
+	}, nil
 }
 
-func convertToResponseServiceKind(serviceKind structs.ServiceKind) (respKind pbdataplane.ServiceKind) {
-	switch serviceKind {
-	case structs.ServiceKindConnectProxy:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_CONNECT_PROXY
-	case structs.ServiceKindMeshGateway:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_MESH_GATEWAY
-	case structs.ServiceKindTerminatingGateway:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_TERMINATING_GATEWAY
-	case structs.ServiceKindIngressGateway:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_INGRESS_GATEWAY
-	case structs.ServiceKindTypical:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_TYPICAL
+func makeAccessLogs(logs *structs.AccessLogsConfig, logger hclog.Logger) []string {
+	var accessLogs []string
+	if logs.Enabled {
+		envoyLoggers, err := accesslogs.MakeAccessLogs(logs, false)
+		if err != nil {
+			logger.Warn("Error creating the envoy access log config", "error", err)
+		}
+
+		accessLogs = make([]string, 0, len(envoyLoggers))
+
+		for _, msg := range envoyLoggers {
+			logConfig, err := protojson.Marshal(msg)
+			if err != nil {
+				logger.Warn("Error marshaling the envoy access log config", "error", err)
+			}
+			accessLogs = append(accessLogs, string(logConfig))
+		}
 	}
-	return
+
+	return accessLogs
 }

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package proxycfg
 
 import (
@@ -9,7 +12,9 @@ import (
 	"github.com/mitchellh/mapstructure"
 
 	"github.com/hashicorp/consul/acl"
+	cachetype "github.com/hashicorp/consul/agent/cache-types"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/proto/private/pbpeering"
 )
 
 type handlerUpstreams struct {
@@ -21,9 +26,10 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 		return fmt.Errorf("error filling agent cache: %v", u.Err)
 	}
 
-	upstreamsSnapshot := &snap.ConnectProxy.ConfigSnapshotUpstreams
-	if snap.Kind == structs.ServiceKindIngressGateway {
-		upstreamsSnapshot = &snap.IngressGateway.ConfigSnapshotUpstreams
+	upstreamsSnapshot, err := snap.ToConfigSnapshotUpstreams()
+
+	if err != nil {
+		return err
 	}
 
 	switch {
@@ -60,6 +66,14 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 		uid := UpstreamIDFromString(uidString)
 
 		switch snap.Kind {
+		case structs.ServiceKindAPIGateway:
+			if !snap.APIGateway.UpstreamsSet.hasUpstream(uid) {
+				// Discovery chain is not associated with a known explicit or implicit upstream so it is purged/skipped.
+				// The associated watch was likely cancelled.
+				delete(upstreamsSnapshot.DiscoveryChain, uid)
+				s.logger.Trace("discovery-chain watch fired for unknown upstream", "upstream", uid)
+				return nil
+			}
 		case structs.ServiceKindIngressGateway:
 			if _, ok := snap.IngressGateway.UpstreamsSet[uid]; !ok {
 				// Discovery chain is not associated with a known explicit or implicit upstream so it is purged/skipped.
@@ -88,6 +102,7 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 		if err := s.resetWatchesFromChain(ctx, uid, resp.Chain, upstreamsSnapshot); err != nil {
 			return err
 		}
+		reconcilePeeringWatches(upstreamsSnapshot.DiscoveryChain, upstreamsSnapshot.UpstreamConfig, upstreamsSnapshot.PeeredUpstreams, upstreamsSnapshot.PeerUpstreamEndpoints, upstreamsSnapshot.UpstreamPeerTrustBundles)
 
 	case strings.HasPrefix(u.CorrelationID, upstreamPeerWatchIDPrefix):
 		resp, ok := u.Result.(*structs.IndexedCheckServiceNodes)
@@ -95,22 +110,18 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 			return fmt.Errorf("invalid type for response: %T", u.Result)
 		}
 		uidString := strings.TrimPrefix(u.CorrelationID, upstreamPeerWatchIDPrefix)
-
 		uid := UpstreamIDFromString(uidString)
 
-		filteredNodes := hostnameEndpoints(
-			s.logger,
-			GatewayKey{ /*empty so it never matches*/ },
-			resp.Nodes,
-		)
-		if len(filteredNodes) > 0 {
-			if set := upstreamsSnapshot.PeerUpstreamEndpoints.Set(uid, filteredNodes); set {
-				upstreamsSnapshot.PeerUpstreamEndpointsUseHostnames[uid] = struct{}{}
-			}
-		} else {
-			if set := upstreamsSnapshot.PeerUpstreamEndpoints.Set(uid, resp.Nodes); set {
-				delete(upstreamsSnapshot.PeerUpstreamEndpointsUseHostnames, uid)
-			}
+		s.setPeerEndpoints(upstreamsSnapshot, uid, resp.Nodes)
+
+	case strings.HasPrefix(u.CorrelationID, peerTrustBundleIDPrefix):
+		resp, ok := u.Result.(*pbpeering.TrustBundleReadResponse)
+		if !ok {
+			return fmt.Errorf("invalid type for response: %T", u.Result)
+		}
+		peer := strings.TrimPrefix(u.CorrelationID, peerTrustBundleIDPrefix)
+		if resp.Bundle != nil {
+			upstreamsSnapshot.UpstreamPeerTrustBundles.Set(peer, resp.Bundle)
 		}
 
 	case strings.HasPrefix(u.CorrelationID, "upstream-target:"):
@@ -126,11 +137,16 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 
 		uid := UpstreamIDFromString(uidString)
 
+		s.logger.Debug("upstream-target watch fired",
+			"correlationID", correlationID,
+			"nodes", len(resp.Nodes),
+		)
 		if _, ok := upstreamsSnapshot.WatchedUpstreamEndpoints[uid]; !ok {
 			upstreamsSnapshot.WatchedUpstreamEndpoints[uid] = make(map[string]structs.CheckServiceNodes)
 		}
 		upstreamsSnapshot.WatchedUpstreamEndpoints[uid][targetID] = resp.Nodes
 
+		// Skip adding passthroughs unless it's a connect sidecar in tproxy mode.
 		if s.kind != structs.ServiceKindConnectProxy || s.proxyCfg.Mode != structs.ProxyModeTransparent {
 			return nil
 		}
@@ -148,7 +164,17 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 		passthroughs := make(map[string]struct{})
 
 		for _, node := range resp.Nodes {
-			if !node.Service.Proxy.TransparentProxy.DialedDirectly {
+			dialedDirectly := node.Service.Proxy.TransparentProxy.DialedDirectly
+			// We must do a manual merge here on the DialedDirectly field, because the service-defaults
+			// and proxy-defaults are not automatically merged into the CheckServiceNodes when in
+			// agentless mode (because the streaming backend doesn't yet support the MergeCentralConfig field).
+			if chain := snap.ConnectProxy.DiscoveryChain[uid]; chain != nil {
+				if target := chain.Targets[targetID]; target != nil {
+					dialedDirectly = dialedDirectly || target.TransparentProxy.DialedDirectly
+				}
+			}
+			// Skip adding a passthrough for the upstream node if not DialedDirectly.
+			if !dialedDirectly {
 				continue
 			}
 
@@ -179,29 +205,33 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 			upstreamsSnapshot.PassthroughIndices[addr] = indexedTarget{idx: csnIdx, upstreamID: uid, targetID: targetID}
 			passthroughs[addr] = struct{}{}
 		}
+		// Always clear out the existing target passthroughs list so that clusters are cleaned up
+		// correctly if no entries are populated.
+		upstreamsSnapshot.PassthroughUpstreams[uid] = make(map[string]map[string]struct{})
 		if len(passthroughs) > 0 {
-			upstreamsSnapshot.PassthroughUpstreams[uid] = map[string]map[string]struct{}{
-				targetID: passthroughs,
-			}
+			// Add the passthroughs to the target if any were found.
+			upstreamsSnapshot.PassthroughUpstreams[uid][targetID] = passthroughs
 		}
 
 	case strings.HasPrefix(u.CorrelationID, "mesh-gateway:"):
-		resp, ok := u.Result.(*structs.IndexedNodesWithGateways)
+		resp, ok := u.Result.(*structs.IndexedCheckServiceNodes)
 		if !ok {
 			return fmt.Errorf("invalid type for response: %T", u.Result)
 		}
 		correlationID := strings.TrimPrefix(u.CorrelationID, "mesh-gateway:")
-		key, uidString, ok := removeColonPrefix(correlationID)
-		if !ok {
-			return fmt.Errorf("invalid correlation id %q", u.CorrelationID)
-		}
-		uid := UpstreamIDFromString(uidString)
+		key, uidString, ok := strings.Cut(correlationID, ":")
+		if ok {
+			// correlationID formatted with an upstreamID
+			uid := UpstreamIDFromString(uidString)
 
-		if _, ok = upstreamsSnapshot.WatchedGatewayEndpoints[uid]; !ok {
-			upstreamsSnapshot.WatchedGatewayEndpoints[uid] = make(map[string]structs.CheckServiceNodes)
+			if _, ok = upstreamsSnapshot.WatchedGatewayEndpoints[uid]; !ok {
+				upstreamsSnapshot.WatchedGatewayEndpoints[uid] = make(map[string]structs.CheckServiceNodes)
+			}
+			upstreamsSnapshot.WatchedGatewayEndpoints[uid][key] = resp.Nodes
+		} else {
+			// event was for local gateways only
+			upstreamsSnapshot.WatchedLocalGWEndpoints.Set(key, resp.Nodes)
 		}
-		upstreamsSnapshot.WatchedGatewayEndpoints[uid][key] = resp.Nodes
-
 	default:
 		return fmt.Errorf("unknown correlation ID: %s", u.CorrelationID)
 	}
@@ -214,6 +244,23 @@ func removeColonPrefix(s string) (string, string, bool) {
 		return "", "", false
 	}
 	return s[0:idx], s[idx+1:], true
+}
+
+func (s *handlerUpstreams) setPeerEndpoints(upstreamsSnapshot *ConfigSnapshotUpstreams, uid UpstreamID, nodes structs.CheckServiceNodes) {
+	filteredNodes := hostnameEndpoints(
+		s.logger,
+		GatewayKey{ /*empty so it never matches*/ },
+		nodes,
+	)
+	if len(filteredNodes) > 0 {
+		if set := upstreamsSnapshot.PeerUpstreamEndpoints.Set(uid, filteredNodes); set {
+			upstreamsSnapshot.PeerUpstreamEndpointsUseHostnames[uid] = struct{}{}
+		}
+	} else {
+		if set := upstreamsSnapshot.PeerUpstreamEndpoints.Set(uid, nodes); set {
+			delete(upstreamsSnapshot.PeerUpstreamEndpointsUseHostnames, uid)
+		}
+	}
 }
 
 func (s *handlerUpstreams) resetWatchesFromChain(
@@ -274,8 +321,14 @@ func (s *handlerUpstreams) resetWatchesFromChain(
 			service:    target.Service,
 			filter:     target.Subset.Filter,
 			datacenter: target.Datacenter,
+			peer:       target.Peer,
 			entMeta:    target.GetEnterpriseMetadata(),
 		}
+		// Peering targets do not set the datacenter field, so we should default it here.
+		if opts.datacenter == "" {
+			opts.datacenter = s.source.Datacenter
+		}
+
 		err := s.watchUpstreamTarget(ctx, snap, opts)
 		if err != nil {
 			return fmt.Errorf("failed to watch target %q for upstream %q", target.ID, uid)
@@ -293,12 +346,24 @@ func (s *handlerUpstreams) resetWatchesFromChain(
 			}
 		case structs.MeshGatewayModeLocal:
 			gk = GatewayKey{
-				Partition:  s.source.NodePartitionOrDefault(),
+				Partition:  s.proxyID.PartitionOrDefault(),
 				Datacenter: s.source.Datacenter,
+			}
+		default:
+			// if target.MeshGateway.Mode is not set and target is not peered we don't want to set up watches for the gateway.
+			// This is important specifically in wan-fed without mesh gateway use case, as for this case
+			//the source and target DC could be different but there is not  mesh-gateway so no need to watch
+			// a costly watch (Internal.ServiceDump)
+			if target.Peer == "" {
+				continue
 			}
 		}
 		if s.source.Datacenter != target.Datacenter || s.proxyID.PartitionOrDefault() != target.Partition {
 			needGateways[gk.String()] = struct{}{}
+		}
+		// Register a local gateway watch if any targets are pointing to a peer and require a mode of local.
+		if target.Peer != "" && target.MeshGateway.Mode == structs.MeshGatewayModeLocal {
+			s.setupWatchForLocalGWEndpoints(ctx, snap)
 		}
 	}
 
@@ -331,6 +396,7 @@ func (s *handlerUpstreams) resetWatchesFromChain(
 		if _, ok := snap.WatchedGateways[uid][key]; ok {
 			continue
 		}
+
 		gwKey := gatewayKeyFromString(key)
 
 		s.logger.Trace("initializing watch of mesh gateway",
@@ -349,13 +415,14 @@ func (s *handlerUpstreams) resetWatchesFromChain(
 			key:                 gwKey,
 			upstreamID:          uid,
 		}
+
 		err := watchMeshGateway(ctx, opts)
 		if err != nil {
 			cancel()
 			return err
 		}
-
 		snap.WatchedGateways[uid][key] = cancel
+
 	}
 
 	for key, cancelFn := range snap.WatchedGateways[uid] {
@@ -384,6 +451,7 @@ type targetWatchOpts struct {
 	service    string
 	filter     string
 	datacenter string
+	peer       string
 	entMeta    *acl.EnterpriseMeta
 }
 
@@ -394,14 +462,21 @@ func (s *handlerUpstreams) watchUpstreamTarget(ctx context.Context, snap *Config
 		"target", opts.chainID,
 	)
 
-	var finalMeta acl.EnterpriseMeta
-	finalMeta.Merge(opts.entMeta)
+	uid := opts.upstreamID
+	correlationID := "upstream-target:" + opts.chainID + ":" + uid.String()
 
-	correlationID := "upstream-target:" + opts.chainID + ":" + opts.upstreamID.String()
+	if opts.peer != "" {
+		uid = NewUpstreamIDFromTargetID(opts.chainID)
+		correlationID = upstreamPeerWatchIDPrefix + uid.String()
+	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	err := s.dataSources.Health.Notify(ctx, &structs.ServiceSpecificRequest{
-		PeerName:   opts.upstreamID.Peer,
+	// Perform this merge so that a nil EntMeta isn't possible.
+	var entMeta acl.EnterpriseMeta
+	entMeta.Merge(opts.entMeta)
+
+	peerCtx, cancel := context.WithCancel(ctx)
+	err := s.dataSources.Health.Notify(peerCtx, &structs.ServiceSpecificRequest{
+		PeerName:   opts.peer,
 		Datacenter: opts.datacenter,
 		QueryOptions: structs.QueryOptions{
 			Token:  s.token,
@@ -413,7 +488,7 @@ func (s *handlerUpstreams) watchUpstreamTarget(ctx context.Context, snap *Config
 		// the default and makes metrics and other things much cleaner. It's
 		// simpler for us if we have the type to make things unambiguous.
 		Source:         *s.source,
-		EnterpriseMeta: finalMeta,
+		EnterpriseMeta: entMeta,
 	}, correlationID, s.ch)
 
 	if err != nil {
@@ -421,6 +496,31 @@ func (s *handlerUpstreams) watchUpstreamTarget(ctx context.Context, snap *Config
 		return err
 	}
 	snap.WatchedUpstreams[opts.upstreamID][opts.chainID] = cancel
+
+	if uid.Peer == "" {
+		return nil
+	}
+
+	if !snap.PeerUpstreamEndpoints.IsWatched(uid) {
+		snap.PeerUpstreamEndpoints.InitWatch(uid, cancel)
+	}
+	// Check whether a watch for this peer exists to avoid duplicates.
+
+	if !snap.UpstreamPeerTrustBundles.IsWatched(uid.Peer) {
+		peerCtx2, cancel2 := context.WithCancel(ctx)
+		if err := s.dataSources.TrustBundle.Notify(peerCtx2, &cachetype.TrustBundleReadRequest{
+			Request: &pbpeering.TrustBundleReadRequest{
+				Name:      uid.Peer,
+				Partition: uid.PartitionOrDefault(),
+			},
+			QueryOptions: structs.QueryOptions{Token: s.token},
+		}, peerTrustBundleIDPrefix+uid.Peer, s.ch); err != nil {
+			cancel2()
+			return fmt.Errorf("error while watching trust bundle for peer %q: %w", uid.Peer, err)
+		}
+
+		snap.UpstreamPeerTrustBundles.InitWatch(uid.Peer, cancel2)
+	}
 
 	return nil
 }
@@ -438,6 +538,8 @@ type discoveryChainWatchOpts struct {
 func (s *handlerUpstreams) watchDiscoveryChain(ctx context.Context, snap *ConfigSnapshot, opts discoveryChainWatchOpts) error {
 	var watchedDiscoveryChains map[UpstreamID]context.CancelFunc
 	switch s.kind {
+	case structs.ServiceKindAPIGateway:
+		watchedDiscoveryChains = snap.APIGateway.WatchedDiscoveryChains
 	case structs.ServiceKindIngressGateway:
 		watchedDiscoveryChains = snap.IngressGateway.WatchedDiscoveryChains
 	case structs.ServiceKindConnectProxy:
@@ -489,4 +591,31 @@ func parseReducedUpstreamConfig(m map[string]interface{}) (reducedUpstreamConfig
 	var cfg reducedUpstreamConfig
 	err := mapstructure.WeakDecode(m, &cfg)
 	return cfg, err
+}
+
+func (s *handlerUpstreams) setupWatchForLocalGWEndpoints(
+	ctx context.Context,
+	upstreams *ConfigSnapshotUpstreams,
+) error {
+	gk := GatewayKey{
+		Partition:  s.proxyID.PartitionOrDefault(),
+		Datacenter: s.source.Datacenter,
+	}
+	// If the watch is already initialized, do nothing.
+	if upstreams.WatchedLocalGWEndpoints.IsWatched(gk.String()) {
+		return nil
+	}
+
+	opts := gatewayWatchOpts{
+		internalServiceDump: s.dataSources.InternalServiceDump,
+		notifyCh:            s.ch,
+		source:              *s.source,
+		token:               s.token,
+		key:                 gk,
+	}
+	if err := watchMeshGateway(ctx, opts); err != nil {
+		return fmt.Errorf("error while watching for local mesh gateway: %w", err)
+	}
+	upstreams.WatchedLocalGWEndpoints.InitWatch(gk.String(), nil)
+	return nil
 }

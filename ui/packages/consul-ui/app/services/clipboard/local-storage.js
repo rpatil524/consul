@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Service, { inject as service } from '@ember/service';
 import Clipboard from 'clipboard';
 
@@ -20,7 +25,7 @@ export default class LocalStorageService extends Service {
   key = 'clipboard';
 
   execute(trigger, options) {
-    return new ClipboardCallback(trigger, options, val => {
+    return new ClipboardCallback(trigger, options, (val) => {
       this.doc.defaultView.localStorage.setItem(this.key, val);
     });
   }

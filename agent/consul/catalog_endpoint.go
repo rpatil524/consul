@@ -1,6 +1,10 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package consul
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -16,6 +20,7 @@ import (
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/acl/resolver"
+	"github.com/hashicorp/consul/agent/configentry"
 	"github.com/hashicorp/consul/agent/consul/state"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/ipaddr"
@@ -74,9 +79,36 @@ type Catalog struct {
 	logger hclog.Logger
 }
 
+func hasPeerNameInRequest(req *structs.RegisterRequest) bool {
+	if req == nil {
+		return false
+	}
+	// nodes, services, checks
+	if req.PeerName != structs.DefaultPeerKeyword {
+		return true
+	}
+	if req.Service != nil && req.Service.PeerName != structs.DefaultPeerKeyword {
+		return true
+	}
+	if req.Check != nil && req.Check.PeerName != structs.DefaultPeerKeyword {
+		return true
+	}
+	for _, check := range req.Checks {
+		if check.PeerName != structs.DefaultPeerKeyword {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Register a service and/or check(s) in a node, creating the node if it doesn't exist.
 // It is valid to pass no service or checks to simply create the node itself.
 func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error {
+	if !c.srv.config.PeeringTestAllowPeerRegistrations && hasPeerNameInRequest(args) {
+		return fmt.Errorf("cannot register requests with PeerName in them")
+	}
+
 	if done, err := c.srv.ForwardRPC("Catalog.Register", args, reply); done {
 		return err
 	}
@@ -418,7 +450,7 @@ func vetDeregisterWithACL(
 	}
 
 	// This order must match the code in applyDeregister() in
-	// fsm/commands_oss.go since it also evaluates things in this order,
+	// fsm/commands_ce.go since it also evaluates things in this order,
 	// and will ignore fields based on this precedence. This lets us also
 	// ignore them from an ACL perspective.
 	if subj.ServiceID != "" {
@@ -501,18 +533,23 @@ func (c *Catalog) ListNodes(args *structs.DCSpecificRequest, reply *structs.Inde
 				return nil
 			}
 
+			// Note: we filter the results with ACLs *before* applying the user-supplied
+			// bexpr filter to ensure that the user can only run expressions on data that
+			// they have access to.  This is a security measure to prevent users from
+			// running arbitrary expressions on data they don't have access to.
+			// QueryMeta.ResultsFilteredByACLs being true already indicates to the user
+			// that results they don't have access to have been removed.  If they were
+			// also allowed to run the bexpr filter on the data, they could potentially
+			// infer the specific attributes of data they don't have access to.
+			if err := c.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
 			raw, err := filter.Execute(reply.Nodes)
 			if err != nil {
 				return err
 			}
 			reply.Nodes = raw.(structs.Nodes)
-
-			// Note: we filter the results with ACLs *after* applying the user-supplied
-			// bexpr filter, to ensure QueryMeta.ResultsFilteredByACLs does not include
-			// results that would be filtered out even if the user did have permission.
-			if err := c.srv.filterACL(args.Token, reply); err != nil {
-				return err
-			}
 
 			return c.srv.sortNodesByDistanceFrom(args.Source, reply.Nodes)
 		})
@@ -529,12 +566,25 @@ func (c *Catalog) ListServices(args *structs.DCSpecificRequest, reply *structs.I
 		return err
 	}
 
+	// Supporting querying by PeerName in this API would require modifying the return type or the ACL
+	// filtering logic so that it can be made aware that the data queried is coming from a peer.
+	// Currently the ACL filter will receive plain name strings with no awareness of the peer name,
+	// which means that authz will be done as if these were local service names.
+	if args.PeerName != structs.DefaultPeerKeyword {
+		return errors.New("listing service names imported from a peer is not supported")
+	}
+
 	authz, err := c.srv.ResolveTokenAndDefaultMeta(args.Token, &args.EnterpriseMeta, nil)
 	if err != nil {
 		return err
 	}
 
 	if err := c.srv.validateEnterpriseRequest(&args.EnterpriseMeta, false); err != nil {
+		return err
+	}
+
+	filter, err := bexpr.CreateFilter(args.Filter, nil, []*structs.ServiceNode{})
+	if err != nil {
 		return err
 	}
 
@@ -547,10 +597,11 @@ func (c *Catalog) ListServices(args *structs.DCSpecificRequest, reply *structs.I
 		&reply.QueryMeta,
 		func(ws memdb.WatchSet, state *state.Store) error {
 			var err error
+			var serviceNodes structs.ServiceNodes
 			if len(args.NodeMetaFilters) > 0 {
-				reply.Index, reply.Services, err = state.ServicesByNodeMeta(ws, args.NodeMetaFilters, &args.EnterpriseMeta, args.PeerName)
+				reply.Index, serviceNodes, err = state.ServicesByNodeMeta(ws, args.NodeMetaFilters, &args.EnterpriseMeta, args.PeerName)
 			} else {
-				reply.Index, reply.Services, err = state.Services(ws, &args.EnterpriseMeta, args.PeerName)
+				reply.Index, serviceNodes, err = state.Services(ws, &args.EnterpriseMeta, args.PeerName, args.Filter != "")
 			}
 			if err != nil {
 				return err
@@ -561,9 +612,52 @@ func (c *Catalog) ListServices(args *structs.DCSpecificRequest, reply *structs.I
 				return nil
 			}
 
-			c.srv.filterACLWithAuthorizer(authz, reply)
+			// need to temporarily create an IndexedServiceNode so that the ACL filter can be applied
+			// to the service nodes and then re-use those same node to run the filter expression.
+			idxServiceNodeReply := &structs.IndexedServiceNodes{
+				ServiceNodes: serviceNodes,
+				QueryMeta:    reply.QueryMeta,
+			}
+
+			// enforce ACLs
+			c.srv.filterACLWithAuthorizer(authz, idxServiceNodeReply)
+
+			// run the filter expression
+			raw, err := filter.Execute(idxServiceNodeReply.ServiceNodes)
+			if err != nil {
+				return err
+			}
+
+			// convert the result back to the original type
+			reply.Services = servicesTagsByName(raw.(structs.ServiceNodes))
+			reply.QueryMeta = idxServiceNodeReply.QueryMeta
+
 			return nil
 		})
+}
+
+func servicesTagsByName(services []*structs.ServiceNode) structs.Services {
+	unique := make(map[string]map[string]struct{})
+	for _, svc := range services {
+		tags, ok := unique[svc.ServiceName]
+		if !ok {
+			unique[svc.ServiceName] = make(map[string]struct{})
+			tags = unique[svc.ServiceName]
+		}
+		for _, tag := range svc.ServiceTags {
+			tags[tag] = struct{}{}
+		}
+	}
+
+	// Generate the output structure.
+	var results = make(structs.Services)
+	for service, tags := range unique {
+		results[service] = make([]string, 0, len(tags))
+		for tag := range tags {
+			results[service] = append(results[service], tag)
+		}
+	}
+	return results
 }
 
 // ServiceList is used to query the services in a DC.
@@ -639,7 +733,9 @@ func (c *Catalog) ServiceNodes(args *structs.ServiceSpecificRequest, reply *stru
 		}
 	}
 
-	var authzContext acl.AuthorizerContext
+	authzContext := acl.AuthorizerContext{
+		Peer: args.PeerName,
+	}
 	authz, err := c.srv.ResolveTokenAndDefaultMeta(args.Token, &args.EnterpriseMeta, &authzContext)
 	if err != nil {
 		return err
@@ -687,7 +783,7 @@ func (c *Catalog) ServiceNodes(args *structs.ServiceSpecificRequest, reply *stru
 					mergedsn := sn
 					ns := sn.ToNodeService()
 					if ns.IsSidecarProxy() || ns.IsGateway() {
-						cfgIndex, mergedns, err := mergeNodeServiceWithCentralConfig(ws, state, args, ns, c.logger)
+						cfgIndex, mergedns, err := configentry.MergeNodeServiceWithCentralConfig(ws, state, ns, c.logger)
 						if err != nil {
 							return err
 						}
@@ -733,19 +829,24 @@ func (c *Catalog) ServiceNodes(args *structs.ServiceSpecificRequest, reply *stru
 				reply.ServiceNodes = filtered
 			}
 
+			// Note: we filter the results with ACLs *before* applying the user-supplied
+			// bexpr filter to ensure that the user can only run expressions on data that
+			// they have access to.  This is a security measure to prevent users from
+			// running arbitrary expressions on data they don't have access to.
+			// QueryMeta.ResultsFilteredByACLs being true already indicates to the user
+			// that results they don't have access to have been removed.  If they were
+			// also allowed to run the bexpr filter on the data, they could potentially
+			// infer the specific attributes of data they don't have access to.
+			if err := c.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
 			// This is safe to do even when the filter is nil - its just a no-op then
 			raw, err := filter.Execute(reply.ServiceNodes)
 			if err != nil {
 				return err
 			}
 			reply.ServiceNodes = raw.(structs.ServiceNodes)
-
-			// Note: we filter the results with ACLs *after* applying the user-supplied
-			// bexpr filter, to ensure QueryMeta.ResultsFilteredByACLs does not include
-			// results that would be filtered out even if the user did have permission.
-			if err := c.srv.filterACL(args.Token, reply); err != nil {
-				return err
-			}
 
 			return c.srv.sortNodesByDistanceFrom(args.Source, reply.ServiceNodes)
 		})
@@ -824,19 +925,24 @@ func (c *Catalog) NodeServices(args *structs.NodeSpecificRequest, reply *structs
 			}
 			reply.Index, reply.NodeServices = index, services
 
+			// Note: we filter the results with ACLs *before* applying the user-supplied
+			// bexpr filter to ensure that the user can only run expressions on data that
+			// they have access to.  This is a security measure to prevent users from
+			// running arbitrary expressions on data they don't have access to.
+			// QueryMeta.ResultsFilteredByACLs being true already indicates to the user
+			// that results they don't have access to have been removed.  If they were
+			// also allowed to run the bexpr filter on the data, they could potentially
+			// infer the specific attributes of data they don't have access to.
+			if err := c.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
 			if reply.NodeServices != nil {
 				raw, err := filter.Execute(reply.NodeServices.Services)
 				if err != nil {
 					return err
 				}
 				reply.NodeServices.Services = raw.(map[string]*structs.NodeService)
-			}
-
-			// Note: we filter the results with ACLs *after* applying the user-supplied
-			// bexpr filter, to ensure QueryMeta.ResultsFilteredByACLs does not include
-			// results that would be filtered out even if the user did have permission.
-			if err := c.srv.filterACL(args.Token, reply); err != nil {
-				return err
 			}
 
 			return nil
@@ -891,11 +997,7 @@ func (c *Catalog) NodeServiceList(args *structs.NodeSpecificRequest, reply *stru
 				for _, ns := range services.Services {
 					mergedns := ns
 					if ns.IsSidecarProxy() || ns.IsGateway() {
-						serviceSpecificReq := structs.ServiceSpecificRequest{
-							Datacenter:   args.Datacenter,
-							QueryOptions: args.QueryOptions,
-						}
-						cfgIndex, mergedns, err = mergeNodeServiceWithCentralConfig(ws, state, &serviceSpecificReq, ns, c.logger)
+						cfgIndex, mergedns, err = configentry.MergeNodeServiceWithCentralConfig(ws, state, ns, c.logger)
 						if err != nil {
 							return err
 						}
@@ -933,20 +1035,25 @@ func (c *Catalog) NodeServiceList(args *structs.NodeSpecificRequest, reply *stru
 
 			if mergedServices != nil {
 				reply.NodeServices = *mergedServices
-
-				raw, err := filter.Execute(reply.NodeServices.Services)
-				if err != nil {
-					return err
-				}
-				reply.NodeServices.Services = raw.([]*structs.NodeService)
 			}
 
-			// Note: we filter the results with ACLs *after* applying the user-supplied
-			// bexpr filter, to ensure QueryMeta.ResultsFilteredByACLs does not include
-			// results that would be filtered out even if the user did have permission.
+			// Note: we filter the results with ACLs *before* applying the user-supplied
+			// bexpr filter to ensure that the user can only run expressions on data that
+			// they have access to.  This is a security measure to prevent users from
+			// running arbitrary expressions on data they don't have access to.
+			// QueryMeta.ResultsFilteredByACLs being true already indicates to the user
+			// that results they don't have access to have been removed.  If they were
+			// also allowed to run the bexpr filter on the data, they could potentially
+			// infer the specific attributes of data they don't have access to.
 			if err := c.srv.filterACL(args.Token, reply); err != nil {
 				return err
 			}
+
+			raw, err := filter.Execute(reply.NodeServices.Services)
+			if err != nil {
+				return err
+			}
+			reply.NodeServices.Services = raw.([]*structs.NodeService)
 
 			return nil
 		})
@@ -1021,7 +1128,9 @@ func (c *Catalog) VirtualIPForService(args *structs.ServiceSpecificRequest, repl
 		return err
 	}
 
-	var authzContext acl.AuthorizerContext
+	authzContext := acl.AuthorizerContext{
+		Peer: args.PeerName,
+	}
 	authz, err := c.srv.ResolveTokenAndDefaultMeta(args.Token, &args.EnterpriseMeta, &authzContext)
 	if err != nil {
 		return err

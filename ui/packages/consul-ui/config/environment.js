@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 // All of the configuration here is shared between buildtime and runtime and
 // is therefore added to ember's <meta> tag in the actual app, if the
 // configuration is for buildtime only you should probably just use
@@ -12,7 +17,7 @@ const repositoryYear = utils.repositoryYear;
 const repositorySHA = utils.repositorySHA;
 const binaryVersion = utils.binaryVersion(repositoryRoot);
 
-module.exports = function(environment, $ = process.env) {
+module.exports = function (environment, $ = process.env) {
   // available environments
   // ['production', 'development', 'staging', 'test'];
   const env = utils.env($);
@@ -70,6 +75,7 @@ module.exports = function(environment, $ = process.env) {
     CONSUL_COPYRIGHT_YEAR: env('CONSUL_COPYRIGHT_YEAR', repositoryYear),
     CONSUL_GIT_SHA: env('CONSUL_GIT_SHA', repositorySHA),
     CONSUL_VERSION: env('CONSUL_VERSION', binaryVersion),
+    // TODO(spatel): CE refactor
     CONSUL_BINARY_TYPE: env('CONSUL_BINARY_TYPE', 'oss'),
 
     // These can be overwritten by the UI user at runtime by setting localStorage values
@@ -84,8 +90,11 @@ module.exports = function(environment, $ = process.env) {
       SSOEnabled: false,
       PeeringEnabled: false,
       PartitionsEnabled: false,
+      HCPEnabled: false,
       LocalDatacenter: env('CONSUL_DATACENTER_LOCAL', 'dc1'),
       PrimaryDatacenter: env('CONSUL_DATACENTER_PRIMARY', 'dc1'),
+      APIPrefix: env('CONSUL_API_PREFIX', ''),
+      V2CatalogEnabled: false,
     },
 
     // Static variables used in multiple places throughout the UI
@@ -94,6 +103,7 @@ module.exports = function(environment, $ = process.env) {
     CONSUL_DOCS_URL: 'https://www.consul.io/docs',
     CONSUL_DOCS_LEARN_URL: 'https://learn.hashicorp.com',
     CONSUL_DOCS_API_URL: 'https://www.consul.io/api',
+    CONSUL_DOCS_DEVELOPER_URL: 'https://developer.hashicorp.com/consul/docs',
     CONSUL_COPYRIGHT_URL: 'https://www.hashicorp.com',
   });
   switch (true) {
@@ -109,8 +119,11 @@ module.exports = function(environment, $ = process.env) {
           // in testing peering feature is on by default
           PeeringEnabled: env('CONSUL_PEERINGS_ENABLED', true),
           PartitionsEnabled: env('CONSUL_PARTITIONS_ENABLED', false),
+          HCPEnabled: env('CONSUL_HCP_ENABLED', false),
           LocalDatacenter: env('CONSUL_DATACENTER_LOCAL', 'dc1'),
           PrimaryDatacenter: env('CONSUL_DATACENTER_PRIMARY', 'dc1'),
+          APIPrefix: env('CONSUL_API_PREFIX', ''),
+          V2CatalogEnabled: env('CONSUL_V2_CATALOG_ENABLED', false),
         },
 
         '@hashicorp/ember-cli-api-double': {
@@ -118,6 +131,7 @@ module.exports = function(environment, $ = process.env) {
           enabled: true,
           endpoints: {
             '/v1': '/mock-api/v1',
+            '/prefixed-api': '/mock-api/prefixed-api',
           },
         },
         APP: Object.assign({}, ENV.APP, {
@@ -160,8 +174,11 @@ module.exports = function(environment, $ = process.env) {
           SSOEnabled: env('CONSUL_SSO_ENABLED', true),
           PeeringEnabled: env('CONSUL_PEERINGS_ENABLED', true),
           PartitionsEnabled: env('CONSUL_PARTITIONS_ENABLED', true),
+          HCPEnabled: env('CONSUL_HCP_ENABLED', false),
           LocalDatacenter: env('CONSUL_DATACENTER_LOCAL', 'dc1'),
           PrimaryDatacenter: env('CONSUL_DATACENTER_PRIMARY', 'dc1'),
+          APIPrefix: env('CONSUL_API_PREFIX', ''),
+          V2CatalogEnabled: env('CONSUL_V2_CATALOG_ENABLED', false),
         },
 
         '@hashicorp/ember-cli-api-double': {
@@ -176,7 +193,9 @@ module.exports = function(environment, $ = process.env) {
       ENV = Object.assign({}, ENV, {
         // in production operatorConfig is populated at consul runtime from
         // operator configuration
-        operatorConfig: {},
+        operatorConfig: {
+          APIPrefix: '',
+        },
       });
       break;
   }

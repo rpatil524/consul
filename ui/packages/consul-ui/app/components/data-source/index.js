@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint no-console: ["error", { allow: ["debug"] }] */
 import Component from '@glimmer/component';
 import { inject as service } from '@ember/service';
@@ -15,7 +20,7 @@ import { runInDebug } from '@ember/debug';
  * @param value - value to use for replacement
  * @param destroy {(prev: any, value: any) => any} - teardown function
  */
-const replace = function(
+const replace = function (
   obj,
   prop,
   value,
@@ -29,7 +34,7 @@ const replace = function(
 };
 
 const noop = () => {};
-const optional = op => (typeof op === 'function' ? op : noop);
+const optional = (op) => (typeof op === 'function' ? op : noop);
 
 // possible values for @loading=""
 const LOADING = ['eager', 'lazy'];
@@ -74,7 +79,7 @@ export default class DataSource extends Component {
     // otherwise its an array from the did-insert-helper
     if (!Array.isArray($el)) {
       this._lazyListeners.add(
-        this.dom.isInViewport($el, inViewport => {
+        this.dom.isInViewport($el, (inViewport) => {
           this.isIntersecting = inViewport;
           if (!this.isIntersecting) {
             this.close();
@@ -130,7 +135,7 @@ export default class DataSource extends Component {
         this.dataSource.close(prev, this);
       }
     );
-    const error = err => {
+    const error = (err) => {
       try {
         const error = get(err, 'error.errors.firstObject') || {};
         if (get(error, 'status') !== '429') {
@@ -143,14 +148,14 @@ export default class DataSource extends Component {
     };
     // set up the listeners (which auto cleanup on component destruction)
     const remove = this._listeners.add(this.source, {
-      message: e => {
+      message: (e) => {
         try {
           this.onchange(e);
         } catch (err) {
           error(err);
         }
       },
-      error: e => {
+      error: (e) => {
         error(e);
       },
     });
@@ -187,7 +192,7 @@ export default class DataSource extends Component {
     this.disconnect();
     schedule('afterRender', () => {
       // TODO: Support lazy data-sources by keeping a reference to $el
-      runInDebug(_ =>
+      runInDebug((_) =>
         console.debug(
           `Invalidation is only supported for non-lazy data sources. If you want to use this you should fixup support for lazy data sources`
         )

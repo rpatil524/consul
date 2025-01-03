@@ -1,27 +1,30 @@
 ---
 layout: docs
-page_title: Security
+page_title: Security - Overview
 description: >-
-  Consul relies on both a lightweight gossip mechanism and an RPC system to
-  provide various features. Both of the systems have different security
-  mechanisms that stem from their designs. However, the security mechanisms of
-  Consul have a common goal: to provide confidentiality, integrity, and
-  authentication.
+  Security requirements and recommendations for Consul vary depending on workloads and environments. Learn how ACLs and encryption can protect access to and communication within your datacenter.
 ---
+
+# Consul security
+
+This topic describes the security requirements and recommendations for a Consul deployment.
 
 ## Security Models
 
 Requirements and recommendations for operating a secure Consul deployment may vary drastically depending on your
 intended workloads, operating system, and environment. You can find detailed information about the various personas,
-recommendations, requirements, and threats [here](/docs/security/security-models).
+recommendations, requirements, and threats in the [Security Models](/consul/docs/security/security-models) section.
 
 ## ACLs
 
-Consul provides an optional [Access Control List (ACL) system](/docs/security/acl) which can be used to control access
+Consul provides an optional [Access Control List (ACL) system](/consul/docs/security/acl) which can be used to control access
 to data and APIs.
 
 ## Encryption
 
-The Consul agent supports encrypting all of its network traffic. The exact method of encryption is described on the
-[encryption security page](/docs/security/encryption). There are two separate encryption systems, one for gossip
-traffic and one for HTTP + RPC.
+The Consul agent supports encryption for all of its network traffic. There are two separate encryption systems:
+
+- A gossip encryption system
+- An mTLS encryption system for HTTP and RPC
+
+For more information about these two different encryption systems, as well as configuration guidance, refer to [Consul encryption](/consul/docs/security/encryption).

@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import BaseAbility from './base';
 
 export default class ZerviceAbility extends BaseAbility {
@@ -12,7 +17,7 @@ export default class ZerviceAbility extends BaseAbility {
       return false;
     }
     const found = this.item.Resources.find(
-      item => item.Resource === 'intention' && item.Access === 'read' && item.Allow === true
+      (item) => item.Resource === 'intention' && item.Access === 'read' && item.Allow === true
     );
     return typeof found !== 'undefined';
   }
@@ -22,7 +27,7 @@ export default class ZerviceAbility extends BaseAbility {
       return false;
     }
     const found = this.item.Resources.find(
-      item => item.Resource === 'intention' && item.Access === 'write' && item.Allow === true
+      (item) => item.Resource === 'intention' && item.Access === 'write' && item.Allow === true
     );
     return typeof found !== 'undefined';
   }

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package peerstream
 
 import (
@@ -7,12 +10,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/hashicorp/go-hclog"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/agent/structs"
-	"github.com/hashicorp/consul/proto/pbservice"
+	"github.com/hashicorp/consul/proto/private/pbservice"
 )
 
 // subscriptionState is a collection of working state tied to a peerID subscription.
@@ -93,6 +96,12 @@ func (s *subscriptionState) cleanupEventVersions(logger hclog.Logger) {
 		case id == caRootsPayloadID:
 			keep = true
 
+		case id == serverAddrsPayloadID:
+			keep = true
+
+		case id == exportedServiceListID:
+			keep = true
+
 		case strings.HasPrefix(id, servicePayloadIDPrefix):
 			name := strings.TrimPrefix(id, servicePayloadIDPrefix)
 			sn := structs.ServiceNameFromString(name)
@@ -129,8 +138,10 @@ type pendingEvent struct {
 }
 
 const (
+	serverAddrsPayloadID          = "server-addrs"
 	caRootsPayloadID              = "roots"
 	meshGatewayPayloadID          = "mesh-gateway"
+	exportedServiceListID         = "exported-service-list"
 	servicePayloadIDPrefix        = "service:"
 	discoveryChainPayloadIDPrefix = "chain:"
 )
@@ -158,15 +169,15 @@ func (p *pendingPayload) Add(id string, correlationID string, raw interface{}) e
 
 func hashProtobuf(res proto.Message) (string, error) {
 	h := sha256.New()
-	buffer := proto.NewBuffer(nil)
-	buffer.SetDeterministic(true)
+	marshaller := proto.MarshalOptions{
+		Deterministic: true,
+	}
 
-	err := buffer.Marshal(res)
+	data, err := marshaller.Marshal(res)
 	if err != nil {
 		return "", err
 	}
-	h.Write(buffer.Bytes())
-	buffer.Reset()
+	h.Write(data)
 
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

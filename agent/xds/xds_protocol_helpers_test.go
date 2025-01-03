@@ -1,13 +1,16 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package xds
 
 import (
+	"context"
 	"sort"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/agent/connect"
-
+	"github.com/armon/go-metrics"
 	envoy_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	envoy_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_endpoint_v3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
@@ -22,18 +25,19 @@ import (
 	envoy_upstreams_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	envoy_discovery_v3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-
-	"github.com/armon/go-metrics"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/mitchellh/copystructure"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/hashicorp/consul/agent/connect"
+	"github.com/hashicorp/consul/agent/grpc-external/limiter"
 	"github.com/hashicorp/consul/agent/proxycfg"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/agent/xds/response"
+	"github.com/hashicorp/consul/envoyextensions/xdscommon"
 	"github.com/hashicorp/consul/sdk/testutil"
 )
 
@@ -44,9 +48,10 @@ func newTestSnapshot(
 	t *testing.T,
 	prevSnap *proxycfg.ConfigSnapshot,
 	dbServiceProtocol string,
+	nsFn func(ns *structs.NodeService),
 	additionalEntries ...structs.ConfigEntry,
 ) *proxycfg.ConfigSnapshot {
-	snap := proxycfg.TestConfigSnapshotDiscoveryChain(t, "default", nil, nil, additionalEntries...)
+	snap := proxycfg.TestConfigSnapshotDiscoveryChain(t, "default", false, nsFn, nil, additionalEntries...)
 	snap.ConnectProxy.PreparedQueryEndpoints = map[proxycfg.UpstreamID]structs.CheckServiceNodes{
 		UID("prepared_query:geo-cache"): proxycfg.TestPreparedQueryNodes(t, "geo-cache"),
 	}
@@ -66,14 +71,18 @@ func newTestSnapshot(
 // testing. It also implements ConnectAuthz to allow control over authorization.
 type testManager struct {
 	sync.Mutex
-	chans   map[structs.ServiceID]chan *proxycfg.ConfigSnapshot
-	cancels chan structs.ServiceID
+	stateChans           map[structs.ServiceID]chan *proxycfg.ConfigSnapshot
+	drainChans           map[structs.ServiceID]chan struct{}
+	cfgSrcTerminateChans map[structs.ServiceID]chan struct{}
+	cancels              chan structs.ServiceID
 }
 
 func newTestManager(t *testing.T) *testManager {
 	return &testManager{
-		chans:   map[structs.ServiceID]chan *proxycfg.ConfigSnapshot{},
-		cancels: make(chan structs.ServiceID, 10),
+		stateChans:           map[structs.ServiceID]chan *proxycfg.ConfigSnapshot{},
+		drainChans:           map[structs.ServiceID]chan struct{}{},
+		cfgSrcTerminateChans: map[structs.ServiceID]chan struct{}{},
+		cancels:              make(chan structs.ServiceID, 10),
 	}
 }
 
@@ -81,7 +90,9 @@ func newTestManager(t *testing.T) *testManager {
 func (m *testManager) RegisterProxy(t *testing.T, proxyID structs.ServiceID) {
 	m.Lock()
 	defer m.Unlock()
-	m.chans[proxyID] = make(chan *proxycfg.ConfigSnapshot, 1)
+	m.stateChans[proxyID] = make(chan *proxycfg.ConfigSnapshot, 1)
+	m.drainChans[proxyID] = make(chan struct{})
+	m.cfgSrcTerminateChans[proxyID] = make(chan struct{})
 }
 
 // Deliver simulates a proxy registration
@@ -90,18 +101,57 @@ func (m *testManager) DeliverConfig(t *testing.T, proxyID structs.ServiceID, cfg
 	m.Lock()
 	defer m.Unlock()
 	select {
-	case m.chans[proxyID] <- cfg:
+	case m.stateChans[proxyID] <- cfg:
 	case <-time.After(10 * time.Millisecond):
 		t.Fatalf("took too long to deliver config")
 	}
 }
 
-// Watch implements ConfigManager
-func (m *testManager) Watch(proxyID structs.ServiceID, _ string, _ string) (<-chan *proxycfg.ConfigSnapshot, proxycfg.CancelFunc, error) {
+// DrainStreams drains any open streams for the given proxyID. If there aren't
+// any open streams, it'll create a marker so that future attempts to watch the
+// given proxyID will return limiter.ErrCapacityReached.
+func (m *testManager) DrainStreams(proxyID structs.ServiceID) {
 	m.Lock()
 	defer m.Unlock()
+
+	ch, ok := m.drainChans[proxyID]
+	if !ok {
+		ch = make(chan struct{})
+		m.drainChans[proxyID] = ch
+	}
+	close(ch)
+}
+
+// CfgSrcTerminate terminates any open streams for the given proxyID by indicating that the
+// corresponding config-source terminated unexpectedly.
+func (m *testManager) CfgSrcTerminate(proxyID structs.ServiceID) {
+	m.Lock()
+	defer m.Unlock()
+
+	ch, ok := m.cfgSrcTerminateChans[proxyID]
+	if !ok {
+		ch = make(chan struct{})
+		m.cfgSrcTerminateChans[proxyID] = ch
+	}
+	close(ch)
+}
+
+// Watch implements ConfigManager
+func (m *testManager) Watch(proxyID structs.ServiceID, _ string, _ string) (<-chan *proxycfg.ConfigSnapshot,
+	limiter.SessionTerminatedChan, proxycfg.SrcTerminatedChan, context.CancelFunc, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	// If the drain chan has already been closed, return limiter.ErrCapacityReached.
+	drainCh := m.drainChans[proxyID]
+	select {
+	case <-drainCh:
+		return nil, nil, nil, nil, limiter.ErrCapacityReached
+	default:
+	}
+
 	// ch might be nil but then it will just block forever
-	return m.chans[proxyID], func() {
+	return m.stateChans[proxyID], drainCh, m.cfgSrcTerminateChans[proxyID], func() {
 		m.cancels <- proxyID
 	}, nil
 }
@@ -131,17 +181,13 @@ type testServerScenario struct {
 
 func newTestServerDeltaScenario(
 	t *testing.T,
-	resolveToken ACLResolverFunc,
+	resolveTokenSecret ACLResolverFunc,
 	proxyID string,
 	token string,
 	authCheckFrequency time.Duration,
-	serverlessPluginEnabled bool,
 ) *testServerScenario {
 	mgr := newTestManager(t)
 	envoy := NewTestEnvoy(t, proxyID, token)
-	t.Cleanup(func() {
-		envoy.Close()
-	})
 
 	sink := metrics.NewInmemSink(1*time.Minute, 1*time.Minute)
 	cfg := metrics.DefaultConfig("consul.xds.test")
@@ -150,6 +196,7 @@ func newTestServerDeltaScenario(
 	metrics.NewGlobal(cfg, sink)
 
 	t.Cleanup(func() {
+		envoy.Close()
 		sink := &metrics.BlackholeSink{}
 		metrics.NewGlobal(cfg, sink)
 	})
@@ -157,9 +204,8 @@ func newTestServerDeltaScenario(
 	s := NewServer(
 		"node-123",
 		testutil.Logger(t),
-		serverlessPluginEnabled,
 		mgr,
-		resolveToken,
+		resolveTokenSecret,
 		nil, /*cfgFetcher ConfigFetcher*/
 	)
 	if authCheckFrequency > 0 {
@@ -200,7 +246,7 @@ func xdsNewEndpoint(ip string, port int) *envoy_endpoint_v3.LbEndpoint {
 	return &envoy_endpoint_v3.LbEndpoint{
 		HostIdentifier: &envoy_endpoint_v3.LbEndpoint_Endpoint{
 			Endpoint: &envoy_endpoint_v3.Endpoint{
-				Address: makeAddress(ip, port),
+				Address: response.MakeAddress(ip, port),
 			},
 		},
 	}
@@ -209,7 +255,7 @@ func xdsNewEndpoint(ip string, port int) *envoy_endpoint_v3.LbEndpoint {
 func xdsNewEndpointWithHealth(ip string, port int, health envoy_core_v3.HealthStatus, weight int) *envoy_endpoint_v3.LbEndpoint {
 	ep := xdsNewEndpoint(ip, port)
 	ep.HealthStatus = health
-	ep.LoadBalancingWeight = makeUint32Value(weight)
+	ep.LoadBalancingWeight = response.MakeUint32Value(weight)
 	return ep
 }
 
@@ -262,14 +308,14 @@ func xdsNewTransportSocket(
 		},
 	}
 	if len(spiffeID) > 0 {
-		require.NoError(t, injectSANMatcher(commonTLSContext, spiffeID...))
+		require.NoError(t, injectSANMatcher(commonTLSContext, false, spiffeID...))
 	}
 
 	var tlsContext proto.Message
 	if downstream {
-		var requireClientCertPB *wrappers.BoolValue
+		var requireClientCertPB *wrapperspb.BoolValue
 		if requireClientCert {
-			requireClientCertPB = makeBoolValue(true)
+			requireClientCertPB = response.MakeBoolValue(true)
 		}
 
 		tlsContext = &envoy_tls_v3.DownstreamTlsContext{
@@ -283,7 +329,7 @@ func xdsNewTransportSocket(
 		}
 	}
 
-	any, err := ptypes.MarshalAny(tlsContext)
+	any, err := anypb.New(tlsContext)
 	require.NoError(t, err)
 
 	return &envoy_core_v3.TransportSocket{
@@ -342,11 +388,11 @@ func makeTestResource(t *testing.T, raw interface{}) *envoy_discovery_v3.Resourc
 		}
 	case proto.Message:
 
-		any, err := ptypes.MarshalAny(res)
+		any, err := anypb.New(res)
 		require.NoError(t, err)
 
 		return &envoy_discovery_v3.Resource{
-			Name:     getResourceName(res),
+			Name:     xdscommon.GetResourceName(res),
 			Version:  mustHashResource(t, res),
 			Resource: any,
 		}
@@ -463,7 +509,7 @@ func makeTestCluster(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName st
 				},
 			},
 		}
-		typedExtensionProtocolOptionsEncoded, err := ptypes.MarshalAny(typedExtensionProtocolOptions)
+		typedExtensionProtocolOptionsEncoded, err := anypb.New(typedExtensionProtocolOptions)
 		require.NoError(t, err)
 		c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
 			"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": typedExtensionProtocolOptionsEncoded,
@@ -569,7 +615,7 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 		return &envoy_listener_v3.Listener{
 			// Envoy can't bind to port 1
 			Name:             "public_listener:0.0.0.0:1",
-			Address:          makeAddress("0.0.0.0", 1),
+			Address:          response.MakeAddress("0.0.0.0", 1),
 			TrafficDirection: envoy_core_v3.TrafficDirection_INBOUND,
 			FilterChains: []*envoy_listener_v3.FilterChain{
 				{
@@ -592,7 +638,7 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 	case "tcp:public_listener":
 		return &envoy_listener_v3.Listener{
 			Name:             "public_listener:0.0.0.0:9999",
-			Address:          makeAddress("0.0.0.0", 9999),
+			Address:          response.MakeAddress("0.0.0.0", 9999),
 			TrafficDirection: envoy_core_v3.TrafficDirection_INBOUND,
 			FilterChains: []*envoy_listener_v3.FilterChain{
 				{
@@ -615,7 +661,7 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 	case "tcp:db":
 		return &envoy_listener_v3.Listener{
 			Name:             "db:127.0.0.1:9191",
-			Address:          makeAddress("127.0.0.1", 9191),
+			Address:          response.MakeAddress("127.0.0.1", 9191),
 			TrafficDirection: envoy_core_v3.TrafficDirection_OUTBOUND,
 			FilterChains: []*envoy_listener_v3.FilterChain{
 				{
@@ -633,7 +679,7 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 	case "http2:db":
 		return &envoy_listener_v3.Listener{
 			Name:             "db:127.0.0.1:9191",
-			Address:          makeAddress("127.0.0.1", 9191),
+			Address:          response.MakeAddress("127.0.0.1", 9191),
 			TrafficDirection: envoy_core_v3.TrafficDirection_OUTBOUND,
 			FilterChains: []*envoy_listener_v3.FilterChain{
 				{
@@ -649,6 +695,9 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 							Tracing: &envoy_http_v3.HttpConnectionManager_Tracing{
 								RandomSampling: &envoy_type_v3.Percent{Value: 0},
 							},
+							UpgradeConfigs: []*envoy_http_v3.HttpConnectionManager_UpgradeConfig{
+								{UpgradeType: "websocket"},
+							},
 							Http2ProtocolOptions: &envoy_core_v3.Http2ProtocolOptions{},
 						}),
 					},
@@ -658,7 +707,7 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 	case "http2:db:rds":
 		return &envoy_listener_v3.Listener{
 			Name:             "db:127.0.0.1:9191",
-			Address:          makeAddress("127.0.0.1", 9191),
+			Address:          response.MakeAddress("127.0.0.1", 9191),
 			TrafficDirection: envoy_core_v3.TrafficDirection_OUTBOUND,
 			FilterChains: []*envoy_listener_v3.FilterChain{
 				{
@@ -676,6 +725,9 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 							StatPrefix: "upstream.db.default.default.dc1",
 							Tracing: &envoy_http_v3.HttpConnectionManager_Tracing{
 								RandomSampling: &envoy_type_v3.Percent{Value: 0},
+							},
+							UpgradeConfigs: []*envoy_http_v3.HttpConnectionManager_UpgradeConfig{
+								{UpgradeType: "websocket"},
 							},
 							Http2ProtocolOptions: &envoy_core_v3.Http2ProtocolOptions{},
 						}),
@@ -686,7 +738,7 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 	case "http:db:rds":
 		return &envoy_listener_v3.Listener{
 			Name:             "db:127.0.0.1:9191",
-			Address:          makeAddress("127.0.0.1", 9191),
+			Address:          response.MakeAddress("127.0.0.1", 9191),
 			TrafficDirection: envoy_core_v3.TrafficDirection_OUTBOUND,
 			FilterChains: []*envoy_listener_v3.FilterChain{
 				{
@@ -705,6 +757,9 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 							Tracing: &envoy_http_v3.HttpConnectionManager_Tracing{
 								RandomSampling: &envoy_type_v3.Percent{Value: 0},
 							},
+							UpgradeConfigs: []*envoy_http_v3.HttpConnectionManager_UpgradeConfig{
+								{UpgradeType: "websocket"},
+							},
 							// HttpProtocolOptions: &envoy_core_v3.Http1ProtocolOptions{},
 						}),
 					},
@@ -714,7 +769,7 @@ func makeTestListener(t *testing.T, snap *proxycfg.ConfigSnapshot, fixtureName s
 	case "tcp:geo-cache":
 		return &envoy_listener_v3.Listener{
 			Name:             "prepared_query:geo-cache:127.10.10.10:8181",
-			Address:          makeAddress("127.10.10.10", 8181),
+			Address:          response.MakeAddress("127.10.10.10", 8181),
 			TrafficDirection: envoy_core_v3.TrafficDirection_OUTBOUND,
 			FilterChains: []*envoy_listener_v3.FilterChain{
 				{
@@ -739,8 +794,7 @@ func makeTestRoute(t *testing.T, fixtureName string) *envoy_route_v3.RouteConfig
 	switch fixtureName {
 	case "http2:db", "http:db":
 		return &envoy_route_v3.RouteConfiguration{
-			Name:             "db",
-			ValidateClusters: makeBoolValue(true),
+			Name: "db",
 			VirtualHosts: []*envoy_route_v3.VirtualHost{
 				{
 					Name:    "db",
@@ -806,7 +860,7 @@ func requireProtocolVersionGauge(
 	require.Len(t, data, 1)
 
 	item := data[0]
-	require.Len(t, item.Gauges, 1)
+	require.Len(t, item.Gauges, 2)
 
 	val, ok := item.Gauges["consul.xds.test.xds.server.streams;version="+xdsVersion]
 	require.True(t, ok)

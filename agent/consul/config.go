@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package consul
 
 import (
@@ -6,14 +9,17 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
-	"golang.org/x/time/rate"
 
 	"github.com/hashicorp/consul/agent/checks"
+	consulrate "github.com/hashicorp/consul/agent/consul/rate"
+	hcpconfig "github.com/hashicorp/consul/agent/hcp/config"
 	"github.com/hashicorp/consul/agent/structs"
-	libserf "github.com/hashicorp/consul/lib/serf"
+	"github.com/hashicorp/consul/internal/gossip/libserf"
 	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/consul/version"
@@ -33,6 +39,12 @@ const (
 	// MaxRaftMultiplier is a fairly arbitrary upper bound that limits the
 	// amount of performance detuning that's possible.
 	MaxRaftMultiplier uint = 10
+
+	// LogStoreBackend* are well-known string values used to configure different
+	// log store backends.
+	LogStoreBackendDefault = "default"
+	LogStoreBackendBoltDB  = "boltdb"
+	LogStoreBackendWAL     = "wal"
 )
 
 var (
@@ -133,6 +145,9 @@ type Config struct {
 	// GRPCPort is the port the public gRPC server listens on.
 	GRPCPort int
 
+	// GRPCTLSPort is the port the public gRPC TLS server listens on.
+	GRPCTLSPort int
+
 	// (Enterprise-only) The network segment this agent is part of.
 	Segment string
 
@@ -226,9 +241,9 @@ type Config struct {
 	AutoConfigAuthzAllowReuse      bool
 
 	// TombstoneTTL is used to control how long KV tombstones are retained.
-	// This provides a window of time where the X-Consul-Index is monotonic.
+	// This provides a window of time when the X-Consul-Index is monotonic.
 	// Outside this window, the index may not be monotonic. This is a result
-	// of a few trade offs:
+	// of a few trade-offs:
 	// 1) The index is defined by the data view and not globally. This is a
 	// performance optimization that prevents any write from incrementing the
 	// index for all data views.
@@ -236,10 +251,10 @@ type Config struct {
 	// is also monotonic. This prevents deletes from reducing the disk space
 	// used.
 	// In theory, neither of these are intrinsic limitations, however for the
-	// purposes of building a practical system, they are reasonable trade offs.
+	// purposes of building a practical system, they are reasonable trade-offs.
 	//
 	// It is also possible to set this to an incredibly long time, thereby
-	// simulating infinite retention. This is not recommended however.
+	// simulating infinite retention. This is not recommended, however.
 	//
 	TombstoneTTL time.Duration
 
@@ -315,6 +330,25 @@ type Config struct {
 	// CheckOutputMaxSize control the max size of output of checks
 	CheckOutputMaxSize int
 
+	// RequestLimitsMode will disable or enable rate limiting.  If not disabled, it
+	// enforces the action that will occur when RequestLimitsReadRate
+	// or RequestLimitsWriteRate is exceeded.  The default value of "disabled" will
+	// prevent any rate limiting from occuring.  A value of "enforce" will block
+	// the request from processings by returning an error.  A value of
+	// "permissive" will not block the request and will allow the request to
+	// continue processing.
+	RequestLimitsMode string
+
+	// RequestLimitsReadRate controls how frequently RPC, gRPC, and HTTP
+	// queries are allowed to happen. In any large enough time interval, rate
+	// limiter limits the rate to RequestLimitsReadRate tokens per second.
+	RequestLimitsReadRate rate.Limit
+
+	// RequestLimitsWriteRate controls how frequently RPC, gRPC, and HTTP
+	// writes are allowed to happen. In any large enough time interval, rate
+	// limiter limits the rate to RequestLimitsWriteRate tokens per second.
+	RequestLimitsWriteRate rate.Limit
+
 	// RPCHandshakeTimeout limits how long we will wait for the initial magic byte
 	// on an RPC client connection. It also governs how long we will wait for a
 	// TLS handshake when TLS is configured however the timout applies separately
@@ -327,6 +361,13 @@ type Config struct {
 	// This period is meant to be long enough for a leader election to take
 	// place, and a small jitter is applied to avoid a thundering herd.
 	RPCHoldTimeout time.Duration
+
+	// RPCClientTimeout limits how long a client is allowed to read from an RPC
+	// connection. This is used to set an upper bound for non-blocking queries to
+	// eventually terminate so that RPC connections are not held indefinitely.
+	// Blocking queries will use MaxQueryTime and DefaultQueryTime to calculate
+	// their own timeouts.
+	RPCClientTimeout time.Duration
 
 	// RPCRateLimit and RPCMaxBurst control how frequently RPC calls are allowed
 	// to happen. In any large enough time interval, rate limiter limits the
@@ -364,12 +405,21 @@ type Config struct {
 	// report usage metrics to the configured go-metrics Sinks.
 	MetricsReportingInterval time.Duration
 
+	DisablePerTenancyUsageMetrics bool
+
 	// ConnectEnabled is whether to enable Connect features such as the CA.
 	ConnectEnabled bool
 
 	// ConnectMeshGatewayWANFederationEnabled determines if wan federation of
 	// datacenters should exclusively traverse mesh gateways.
 	ConnectMeshGatewayWANFederationEnabled bool
+
+	// DefaultIntentionPolicy is used to define a default intention action for all
+	// sources and destinations. Possible values are "allow", "deny", or "" (blank).
+	// For compatibility, falls back to ACLResolverSettings.ACLDefaultPolicy (which
+	// itself has a default of "allow") if left blank. Future versions of Consul
+	// will default this field to "deny" to be secure by default.
+	DefaultIntentionPolicy string
 
 	// DisableFederationStateAntiEntropy solely exists for use in unit tests to
 	// disable a background routine.
@@ -394,13 +444,29 @@ type Config struct {
 
 	RPCConfig RPCConfig
 
-	RaftBoltDBConfig RaftBoltDBConfig
+	LogStoreConfig RaftLogStoreConfig
 
 	// PeeringEnabled enables cluster peering.
 	PeeringEnabled bool
 
+	PeeringTestAllowPeerRegistrations bool
+
+	Locality *structs.Locality
+
+	Cloud hcpconfig.CloudConfig
+
+	Reporting Reporting
+
 	// Embedded Consul Enterprise specific configuration
 	*EnterpriseConfig
+
+	// ServerRejoinAgeMax is used to specify the duration of time a server
+	// is allowed to be down/offline before a startup operation is refused.
+	ServerRejoinAgeMax time.Duration
+}
+
+func (c *Config) InPrimaryDatacenter() bool {
+	return c.PrimaryDatacenter == "" || c.Datacenter == c.PrimaryDatacenter
 }
 
 // CheckProtocolVersion validates the protocol version.
@@ -414,21 +480,17 @@ func (c *Config) CheckProtocolVersion() error {
 	return nil
 }
 
-// CheckACL validates the ACL configuration.
-// TODO: move this to ACLResolverSettings
-func (c *Config) CheckACL() error {
-	switch c.ACLResolverSettings.ACLDefaultPolicy {
-	case "allow":
-	case "deny":
-	default:
-		return fmt.Errorf("Unsupported default ACL policy: %s", c.ACLResolverSettings.ACLDefaultPolicy)
+// CheckEnumStrings validates string configuration which must be specific values.
+func (c *Config) CheckEnumStrings() error {
+	if err := c.ACLResolverSettings.CheckACLs(); err != nil {
+		return err
 	}
-	switch c.ACLResolverSettings.ACLDownPolicy {
-	case "allow":
-	case "deny":
-	case "async-cache", "extend-cache":
+	switch c.DefaultIntentionPolicy {
+	case structs.IntentionDefaultPolicyAllow:
+	case structs.IntentionDefaultPolicyDeny:
+	case "":
 	default:
-		return fmt.Errorf("Unsupported down ACL policy: %s", c.ACLResolverSettings.ACLDownPolicy)
+		return fmt.Errorf("Unsupported default intention policy: %s", c.DefaultIntentionPolicy)
 	}
 	return nil
 }
@@ -474,16 +536,22 @@ func DefaultConfig() *Config {
 		TombstoneTTLGranularity:              30 * time.Second,
 		SessionTTLMin:                        10 * time.Second,
 		ACLTokenMinExpirationTTL:             1 * time.Minute,
-		ACLTokenMaxExpirationTTL:             24 * time.Hour,
+		// Duration is stored as an int64. Setting the default max
+		// to the max possible duration (approx 290 years).
+		ACLTokenMaxExpirationTTL: 1<<63 - 1,
 
 		// These are tuned to provide a total throughput of 128 updates
-		// per second. If you update these, you should update the client-
-		// side SyncCoordinateRateTarget parameter accordingly.
+		// per second. If you update these, you should update the client-side
+		// SyncCoordinateRateTarget parameter accordingly.
 		CoordinateUpdatePeriod:     5 * time.Second,
 		CoordinateUpdateBatchSize:  128,
 		CoordinateUpdateMaxBatches: 5,
 
 		CheckOutputMaxSize: checks.DefaultBufSize,
+
+		RequestLimitsMode:      "disabled",
+		RequestLimitsReadRate:  rate.Inf, // ops / sec
+		RequestLimitsWriteRate: rate.Inf, // ops / sec
 
 		RPCRateLimit: rate.Inf,
 		RPCMaxBurst:  1000,
@@ -506,7 +574,7 @@ func DefaultConfig() *Config {
 			},
 		},
 
-		// Stay under the 10 second aggregation interval of
+		// Stay under the 10-second aggregation interval of
 		// go-metrics. This ensures we always report the
 		// usage metrics in each cycle.
 		MetricsReportingInterval: 9 * time.Second,
@@ -515,9 +583,11 @@ func DefaultConfig() *Config {
 		DefaultQueryTime:         300 * time.Second,
 		MaxQueryTime:             600 * time.Second,
 
-		PeeringEnabled: true,
+		PeeringTestAllowPeerRegistrations: false,
 
 		EnterpriseConfig: DefaultEnterpriseConfig(),
+
+		ServerRejoinAgeMax: 24 * 7 * time.Hour,
 	}
 
 	// Increase our reap interval to 3 days instead of 24h.
@@ -582,6 +652,7 @@ func CloneSerfLANConfig(base *serf.Config) *serf.Config {
 	cfg.MemberlistConfig.ProbeTimeout = base.MemberlistConfig.ProbeTimeout
 	cfg.MemberlistConfig.SuspicionMult = base.MemberlistConfig.SuspicionMult
 	cfg.MemberlistConfig.RetransmitMult = base.MemberlistConfig.RetransmitMult
+	cfg.MemberlistConfig.MetricLabels = base.MemberlistConfig.MetricLabels
 
 	// agent/keyring.go
 	cfg.MemberlistConfig.Keyring = base.MemberlistConfig.Keyring
@@ -591,6 +662,7 @@ func CloneSerfLANConfig(base *serf.Config) *serf.Config {
 	cfg.ReapInterval = base.ReapInterval
 	cfg.TombstoneTimeout = base.TombstoneTimeout
 	cfg.MemberlistConfig.SecretKey = base.MemberlistConfig.SecretKey
+	cfg.MetricLabels = base.MetricLabels
 
 	return cfg
 }
@@ -602,9 +674,19 @@ type RPCConfig struct {
 	EnableStreaming bool
 }
 
+// RequestLimits is configuration for serverrate limiting that is a part of
+// ReloadableConfig.
+type RequestLimits struct {
+	Mode      consulrate.Mode
+	ReadRate  rate.Limit
+	WriteRate rate.Limit
+}
+
 // ReloadableConfig is the configuration that is passed to ReloadConfig when
 // application config is reloaded.
 type ReloadableConfig struct {
+	RequestLimits         *RequestLimits
+	RPCClientTimeout      time.Duration
 	RPCRateLimit          rate.Limit
 	RPCMaxBurst           int
 	RPCMaxConnsPerClient  int
@@ -614,8 +696,34 @@ type ReloadableConfig struct {
 	RaftTrailingLogs      int
 	HeartbeatTimeout      time.Duration
 	ElectionTimeout       time.Duration
+	Reporting             Reporting
+}
+
+type RaftLogStoreConfig struct {
+	Backend         string
+	DisableLogCache bool
+	Verification    RaftLogStoreVerificationConfig
+	BoltDB          RaftBoltDBConfig
+	WAL             WALConfig
+}
+
+type RaftLogStoreVerificationConfig struct {
+	Enabled  bool
+	Interval time.Duration
 }
 
 type RaftBoltDBConfig struct {
 	NoFreelistSync bool
+}
+
+type WALConfig struct {
+	SegmentSize int
+}
+
+type License struct {
+	Enabled bool
+}
+
+type Reporting struct {
+	License License
 }

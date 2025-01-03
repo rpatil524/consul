@@ -1,9 +1,15 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package proxycfg
 
 import (
+	"time"
+
 	"github.com/mitchellh/go-testing-interface"
 
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/api"
 )
 
 func TestConfigSnapshotTerminatingGateway(t testing.T, populateServices bool, nsFn func(ns *structs.NodeService), extraUpdates []UpdateEvent) *ConfigSnapshot {
@@ -154,20 +160,24 @@ func TestConfigSnapshotTerminatingGateway(t testing.T, populateServices bool, ns
 
 		tgtwyServices = append(tgtwyServices,
 			&structs.GatewayService{
-				Service: web,
-				CAFile:  "ca.cert.pem",
+				Service:         web,
+				CAFile:          "ca.cert.pem",
+				AutoHostRewrite: true,
 			},
 			&structs.GatewayService{
-				Service:  api,
-				CAFile:   "ca.cert.pem",
-				CertFile: "api.cert.pem",
-				KeyFile:  "api.key.pem",
+				Service:         api,
+				CAFile:          "ca.cert.pem",
+				CertFile:        "api.cert.pem",
+				KeyFile:         "api.key.pem",
+				AutoHostRewrite: true,
 			},
 			&structs.GatewayService{
-				Service: db,
+				Service:         db,
+				AutoHostRewrite: true,
 			},
 			&structs.GatewayService{
-				Service: cache,
+				Service:         cache,
+				AutoHostRewrite: true,
 			},
 		)
 
@@ -206,19 +216,19 @@ func TestConfigSnapshotTerminatingGateway(t testing.T, populateServices bool, ns
 			// no intentions defined for these services
 			{
 				CorrelationID: serviceIntentionsIDPrefix + web.String(),
-				Result:        structs.Intentions{},
+				Result:        structs.SimplifiedIntentions{},
 			},
 			{
 				CorrelationID: serviceIntentionsIDPrefix + api.String(),
-				Result:        structs.Intentions{},
+				Result:        structs.SimplifiedIntentions{},
 			},
 			{
 				CorrelationID: serviceIntentionsIDPrefix + db.String(),
-				Result:        structs.Intentions{},
+				Result:        structs.SimplifiedIntentions{},
 			},
 			{
 				CorrelationID: serviceIntentionsIDPrefix + cache.String(),
-				Result:        structs.Intentions{},
+				Result:        structs.SimplifiedIntentions{},
 			},
 			// ========
 			{
@@ -328,10 +338,11 @@ func TestConfigSnapshotTerminatingGatewayDestinations(t testing.T, populateDesti
 	roots, _ := TestCerts(t)
 
 	var (
-		externalIPTCP        = structs.NewServiceName("external-IP-TCP", nil)
-		externalHostnameTCP  = structs.NewServiceName("external-hostname-TCP", nil)
-		externalIPHTTP       = structs.NewServiceName("external-IP-HTTP", nil)
-		externalHostnameHTTP = structs.NewServiceName("external-hostname-HTTP", nil)
+		externalIPTCP           = structs.NewServiceName("external-IP-TCP", nil)
+		externalHostnameTCP     = structs.NewServiceName("external-hostname-TCP", nil)
+		externalIPHTTP          = structs.NewServiceName("external-IP-HTTP", nil)
+		externalHostnameHTTP    = structs.NewServiceName("external-hostname-HTTP", nil)
+		externalHostnameWithSNI = structs.NewServiceName("external-hostname-with-SNI", nil)
 	)
 
 	baseEvents := []UpdateEvent{
@@ -352,20 +363,31 @@ func TestConfigSnapshotTerminatingGatewayDestinations(t testing.T, populateDesti
 	if populateDestinations {
 		tgtwyServices = append(tgtwyServices,
 			&structs.GatewayService{
-				Service:     externalIPTCP,
-				ServiceKind: structs.GatewayServiceKindDestination,
+				Service:         externalIPTCP,
+				ServiceKind:     structs.GatewayServiceKindDestination,
+				AutoHostRewrite: true,
 			},
 			&structs.GatewayService{
-				Service:     externalHostnameTCP,
-				ServiceKind: structs.GatewayServiceKindDestination,
+				Service:         externalHostnameTCP,
+				ServiceKind:     structs.GatewayServiceKindDestination,
+				AutoHostRewrite: true,
 			},
 			&structs.GatewayService{
-				Service:     externalIPHTTP,
-				ServiceKind: structs.GatewayServiceKindDestination,
+				Service:         externalIPHTTP,
+				ServiceKind:     structs.GatewayServiceKindDestination,
+				AutoHostRewrite: true,
 			},
 			&structs.GatewayService{
-				Service:     externalHostnameHTTP,
-				ServiceKind: structs.GatewayServiceKindDestination,
+				Service:         externalHostnameHTTP,
+				ServiceKind:     structs.GatewayServiceKindDestination,
+				AutoHostRewrite: true,
+			},
+			&structs.GatewayService{
+				Service:         externalHostnameWithSNI,
+				ServiceKind:     structs.GatewayServiceKindDestination,
+				CAFile:          "cert.pem",
+				SNI:             "api.test.com",
+				AutoHostRewrite: true,
 			},
 		)
 
@@ -379,19 +401,23 @@ func TestConfigSnapshotTerminatingGatewayDestinations(t testing.T, populateDesti
 			// no intentions defined for these services
 			{
 				CorrelationID: serviceIntentionsIDPrefix + externalIPTCP.String(),
-				Result:        structs.Intentions{},
+				Result:        structs.SimplifiedIntentions{},
 			},
 			{
 				CorrelationID: serviceIntentionsIDPrefix + externalHostnameTCP.String(),
-				Result:        structs.Intentions{},
+				Result:        structs.SimplifiedIntentions{},
 			},
 			{
 				CorrelationID: serviceIntentionsIDPrefix + externalIPHTTP.String(),
-				Result:        structs.Intentions{},
+				Result:        structs.SimplifiedIntentions{},
 			},
 			{
 				CorrelationID: serviceIntentionsIDPrefix + externalHostnameHTTP.String(),
-				Result:        structs.Intentions{},
+				Result:        structs.SimplifiedIntentions{},
+			},
+			{
+				CorrelationID: serviceIntentionsIDPrefix + externalHostnameWithSNI.String(),
+				Result:        structs.SimplifiedIntentions{},
 			},
 			// ========
 			{
@@ -417,6 +443,13 @@ func TestConfigSnapshotTerminatingGatewayDestinations(t testing.T, populateDesti
 			},
 			{
 				CorrelationID: serviceLeafIDPrefix + externalHostnameHTTP.String(),
+				Result: &structs.IssuedCert{
+					CertPEM:       "placeholder.crt",
+					PrivateKeyPEM: "placeholder.key",
+				},
+			},
+			{
+				CorrelationID: serviceLeafIDPrefix + externalHostnameWithSNI.String(),
 				Result: &structs.IssuedCert{
 					CertPEM:       "placeholder.crt",
 					PrivateKeyPEM: "placeholder.key",
@@ -474,6 +507,17 @@ func TestConfigSnapshotTerminatingGatewayDestinations(t testing.T, populateDesti
 					},
 				},
 			},
+			{
+				CorrelationID: serviceConfigIDPrefix + externalHostnameWithSNI.String(),
+				Result: &structs.ServiceConfigResponse{
+					Mode:        structs.ProxyModeTransparent,
+					ProxyConfig: map[string]interface{}{"protocol": "tcp"},
+					Destination: structs.DestinationConfig{
+						Addresses: []string{"api.test.com"},
+						Port:      80,
+					},
+				},
+			},
 		})
 	}
 
@@ -495,12 +539,12 @@ func TestConfigSnapshotTerminatingGatewayDestinations(t testing.T, populateDesti
 }
 
 func TestConfigSnapshotTerminatingGatewayServiceSubsets(t testing.T) *ConfigSnapshot {
-	return testConfigSnapshotTerminatingGatewayServiceSubsets(t, false)
+	return testConfigSnapshotTerminatingGatewayServiceSubsets(t, false, nil)
 }
-func TestConfigSnapshotTerminatingGatewayServiceSubsetsWebAndCache(t testing.T) *ConfigSnapshot {
-	return testConfigSnapshotTerminatingGatewayServiceSubsets(t, true)
+func TestConfigSnapshotTerminatingGatewayServiceSubsetsWebAndCache(t testing.T, nsFn func(ns *structs.NodeService)) *ConfigSnapshot {
+	return testConfigSnapshotTerminatingGatewayServiceSubsets(t, true, nsFn)
 }
-func testConfigSnapshotTerminatingGatewayServiceSubsets(t testing.T, alsoAdjustCache bool) *ConfigSnapshot {
+func testConfigSnapshotTerminatingGatewayServiceSubsets(t testing.T, alsoAdjustCache bool, nsFn func(ns *structs.NodeService)) *ConfigSnapshot {
 	var (
 		web   = structs.NewServiceName("web", nil)
 		cache = structs.NewServiceName("cache", nil)
@@ -558,7 +602,7 @@ func testConfigSnapshotTerminatingGatewayServiceSubsets(t testing.T, alsoAdjustC
 		})
 	}
 
-	return TestConfigSnapshotTerminatingGateway(t, true, nil, events)
+	return TestConfigSnapshotTerminatingGateway(t, true, nsFn, events)
 }
 
 func TestConfigSnapshotTerminatingGatewayDefaultServiceSubset(t testing.T) *ConfigSnapshot {
@@ -615,6 +659,7 @@ func testConfigSnapshotTerminatingGatewayLBConfig(t testing.T, variant string) *
 				OnlyPassing: true,
 			},
 		},
+		RequestTimeout: 200 * time.Millisecond,
 		LoadBalancer: &structs.LoadBalancer{
 			Policy: "ring_hash",
 			RingHashConfig: &structs.RingHashConfig{
@@ -677,16 +722,18 @@ func TestConfigSnapshotTerminatingGatewaySNI(t testing.T) *ConfigSnapshot {
 			Result: &structs.IndexedGatewayServices{
 				Services: []*structs.GatewayService{
 					{
-						Service: structs.NewServiceName("web", nil),
-						CAFile:  "ca.cert.pem",
-						SNI:     "foo.com",
+						Service:         structs.NewServiceName("web", nil),
+						CAFile:          "ca.cert.pem",
+						SNI:             "foo.com",
+						AutoHostRewrite: true,
 					},
 					{
-						Service:  structs.NewServiceName("api", nil),
-						CAFile:   "ca.cert.pem",
-						CertFile: "api.cert.pem",
-						KeyFile:  "api.key.pem",
-						SNI:      "bar.com",
+						Service:         structs.NewServiceName("api", nil),
+						CAFile:          "ca.cert.pem",
+						CertFile:        "api.cert.pem",
+						KeyFile:         "api.key.pem",
+						SNI:             "bar.com",
+						AutoHostRewrite: true,
 					},
 				},
 			},
@@ -703,8 +750,9 @@ func TestConfigSnapshotTerminatingGatewayHTTP2(t testing.T) *ConfigSnapshot {
 			Result: &structs.IndexedGatewayServices{
 				Services: []*structs.GatewayService{
 					{
-						Service: web,
-						CAFile:  "ca.cert.pem",
+						Service:         web,
+						CAFile:          "ca.cert.pem",
+						AutoHostRewrite: true,
 					},
 				},
 			},
@@ -763,8 +811,9 @@ func TestConfigSnapshotTerminatingGatewaySubsetsHTTP2(t testing.T) *ConfigSnapsh
 			Result: &structs.IndexedGatewayServices{
 				Services: []*structs.GatewayService{
 					{
-						Service: web,
-						CAFile:  "ca.cert.pem",
+						Service:         web,
+						CAFile:          "ca.cert.pem",
+						AutoHostRewrite: true,
 					},
 				},
 			},
@@ -921,11 +970,14 @@ func TestConfigSnapshotTerminatingGatewayWithLambdaService(t testing.T, extraUpd
 		CorrelationID: serviceConfigIDPrefix + web.String(),
 		Result: &structs.ServiceConfigResponse{
 			ProxyConfig: map[string]interface{}{"protocol": "http"},
-			Meta: map[string]string{
-				"serverless.consul.hashicorp.com/v1alpha1/lambda/enabled":             "true",
-				"serverless.consul.hashicorp.com/v1alpha1/lambda/arn":                 "lambda-arn",
-				"serverless.consul.hashicorp.com/v1alpha1/lambda/payload-passthrough": "true",
-				"serverless.consul.hashicorp.com/v1alpha1/lambda/region":              "us-east-1",
+			EnvoyExtensions: []structs.EnvoyExtension{
+				{
+					Name: api.BuiltinAWSLambdaExtension,
+					Arguments: map[string]interface{}{
+						"ARN":                "arn:aws:lambda:us-east-1:111111111111:function:lambda-1234",
+						"PayloadPassthrough": true,
+					},
+				},
 			},
 		},
 	})

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package structs
 
 import (
@@ -12,12 +15,14 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-bexpr"
+	"github.com/hashicorp/go-multierror"
 	"github.com/mitchellh/copystructure"
 	"github.com/mitchellh/hashstructure"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/lib/maps"
 )
 
 const (
@@ -74,8 +79,17 @@ type ServiceRouterConfigEntry struct {
 	Routes []ServiceRoute
 
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (e *ServiceRouterConfigEntry) SetHash(h uint64) {
+	e.Hash = h
+}
+
+func (e *ServiceRouterConfigEntry) GetHash() uint64 {
+	return e.Hash
 }
 
 func (e *ServiceRouterConfigEntry) GetKind() string {
@@ -124,6 +138,11 @@ func (e *ServiceRouterConfigEntry) Normalize() error {
 		}
 	}
 
+	h, err := HashConfigEntry(e)
+	if err != nil {
+		return err
+	}
+	e.Hash = h
 	return nil
 }
 
@@ -228,6 +247,12 @@ func (e *ServiceRouterConfigEntry) Validate() error {
 			if route.Destination.PrefixRewrite != "" && !eligibleForPrefixRewrite {
 				return fmt.Errorf("Route[%d] cannot make use of PrefixRewrite without configuring either PathExact or PathPrefix", i)
 			}
+
+			for _, r := range route.Destination.RetryOn {
+				if !isValidRetryCondition(r) {
+					return fmt.Errorf("Route[%d] contains an invalid retry condition: %q", i, r)
+				}
+			}
 		}
 	}
 
@@ -245,6 +270,26 @@ func isValidHTTPMethod(method string) bool {
 		http.MethodConnect,
 		http.MethodOptions,
 		http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidRetryCondition(retryOn string) bool {
+	switch retryOn {
+	case "5xx",
+		"gateway-error",
+		"reset",
+		"connect-failure",
+		"envoy-ratelimited",
+		"retriable-4xx",
+		"refused-stream",
+		"cancelled",
+		"deadline-exceeded",
+		"internal",
+		"resource-exhausted",
+		"unavailable":
 		return true
 	default:
 		return false
@@ -327,9 +372,10 @@ func (m *ServiceRouteMatch) IsEmpty() bool {
 
 // ServiceRouteHTTPMatch is a set of http-specific match criteria.
 type ServiceRouteHTTPMatch struct {
-	PathExact  string `json:",omitempty" alias:"path_exact"`
-	PathPrefix string `json:",omitempty" alias:"path_prefix"`
-	PathRegex  string `json:",omitempty" alias:"path_regex"`
+	PathExact       string `json:",omitempty" alias:"path_exact"`
+	PathPrefix      string `json:",omitempty" alias:"path_prefix"`
+	PathRegex       string `json:",omitempty" alias:"path_regex"`
+	CaseInsensitive bool   `json:",omitempty" alias:"case_insensitive"`
 
 	Header     []ServiceRouteHTTPMatchHeader     `json:",omitempty"`
 	QueryParam []ServiceRouteHTTPMatchQueryParam `json:",omitempty" alias:"query_param"`
@@ -340,6 +386,7 @@ func (m *ServiceRouteHTTPMatch) IsEmpty() bool {
 	return m.PathExact == "" &&
 		m.PathPrefix == "" &&
 		m.PathRegex == "" &&
+		!m.CaseInsensitive &&
 		len(m.Header) == 0 &&
 		len(m.QueryParam) == 0 &&
 		len(m.Methods) == 0
@@ -400,6 +447,10 @@ type ServiceRouteDestination struct {
 	// downstream request (and retries) to be processed.
 	RequestTimeout time.Duration `json:",omitempty" alias:"request_timeout"`
 
+	// IdleTimeout is The total amount of time permitted for the request stream
+	// to be idle
+	IdleTimeout time.Duration `json:",omitempty" alias:"idle_timeout"`
+
 	// NumRetries is the number of times to retry the request when a retryable
 	// result occurs. This seems fairly proxy agnostic.
 	NumRetries uint32 `json:",omitempty" alias:"num_retries"`
@@ -408,6 +459,10 @@ type ServiceRouteDestination struct {
 	// retry. This should be expressible in other proxies as it's just a layer
 	// 4 failure bubbling up to layer 7.
 	RetryOnConnectFailure bool `json:",omitempty" alias:"retry_on_connect_failure"`
+
+	// RetryOn allows setting envoy specific conditions when a request should
+	// be automatically retried.
+	RetryOn []string `json:",omitempty" alias:"retry_on"`
 
 	// RetryOnStatusCodes is a flat list of http response status codes that are
 	// eligible for retry. This again should be feasible in any reasonable proxy.
@@ -422,13 +477,19 @@ func (e *ServiceRouteDestination) MarshalJSON() ([]byte, error) {
 	type Alias ServiceRouteDestination
 	exported := &struct {
 		RequestTimeout string `json:",omitempty"`
+		IdleTimeout    string `json:",omitempty"`
 		*Alias
 	}{
 		RequestTimeout: e.RequestTimeout.String(),
+		IdleTimeout:    e.IdleTimeout.String(),
 		Alias:          (*Alias)(e),
 	}
 	if e.RequestTimeout == 0 {
 		exported.RequestTimeout = ""
+	}
+
+	if e.IdleTimeout == 0 {
+		exported.IdleTimeout = ""
 	}
 
 	return json.Marshal(exported)
@@ -438,6 +499,7 @@ func (e *ServiceRouteDestination) UnmarshalJSON(data []byte) error {
 	type Alias ServiceRouteDestination
 	aux := &struct {
 		RequestTimeout string
+		IdleTimeout    string
 		*Alias
 	}{
 		Alias: (*Alias)(e),
@@ -451,11 +513,16 @@ func (e *ServiceRouteDestination) UnmarshalJSON(data []byte) error {
 			return err
 		}
 	}
+	if aux.IdleTimeout != "" {
+		if e.IdleTimeout, err = time.ParseDuration(aux.IdleTimeout); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (d *ServiceRouteDestination) HasRetryFeatures() bool {
-	return d.NumRetries > 0 || d.RetryOnConnectFailure || len(d.RetryOnStatusCodes) > 0
+	return d.NumRetries > 0 || d.RetryOnConnectFailure || len(d.RetryOnStatusCodes) > 0 || len(d.RetryOn) > 0
 }
 
 // ServiceSplitterConfigEntry defines how incoming requests are split across
@@ -486,8 +553,17 @@ type ServiceSplitterConfigEntry struct {
 	Splits []ServiceSplit
 
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (e *ServiceSplitterConfigEntry) SetHash(h uint64) {
+	e.Hash = h
+}
+
+func (e *ServiceSplitterConfigEntry) GetHash() uint64 {
+	return e.Hash
 }
 
 func (e *ServiceSplitterConfigEntry) GetKind() string {
@@ -530,6 +606,11 @@ func (e *ServiceSplitterConfigEntry) Normalize() error {
 		}
 	}
 
+	h, err := HashConfigEntry(e)
+	if err != nil {
+		return err
+	}
+	e.Hash = h
 	return nil
 }
 
@@ -807,30 +888,73 @@ type ServiceResolverConfigEntry struct {
 	// specified here.
 	Failover map[string]ServiceResolverFailover `json:",omitempty"`
 
+	// PrioritizeByLocality controls whether the locality of services within the
+	// local partition will be used to prioritize connectivity.
+	PrioritizeByLocality *ServiceResolverPrioritizeByLocality `json:",omitempty" alias:"prioritize_by_locality"`
+
 	// ConnectTimeout is the timeout for establishing new network connections
 	// to this service.
 	ConnectTimeout time.Duration `json:",omitempty" alias:"connect_timeout"`
+
+	// RequestTimeout is the timeout for an HTTP request to complete before
+	// the connection is automatically terminated. If unspecified, defaults
+	// to 15 seconds.
+	RequestTimeout time.Duration `json:",omitempty" alias:"request_timeout"`
 
 	// LoadBalancer determines the load balancing policy and configuration for services
 	// issuing requests to this upstream service.
 	LoadBalancer *LoadBalancer `json:",omitempty" alias:"load_balancer"`
 
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (e *ServiceResolverConfigEntry) SetHash(h uint64) {
+	e.Hash = h
+}
+
+func (e *ServiceResolverConfigEntry) GetHash() uint64 {
+	return e.Hash
+}
+
+func (e *ServiceResolverConfigEntry) RelatedPeers() []string {
+	peers := make(map[string]struct{})
+
+	if r := e.Redirect; r != nil && r.Peer != "" {
+		peers[r.Peer] = struct{}{}
+	}
+
+	if e.Failover != nil {
+		for _, f := range e.Failover {
+			for _, t := range f.Targets {
+				if t.Peer != "" {
+					peers[t.Peer] = struct{}{}
+				}
+			}
+		}
+	}
+
+	return maps.SliceOfKeys(peers)
 }
 
 func (e *ServiceResolverConfigEntry) MarshalJSON() ([]byte, error) {
 	type Alias ServiceResolverConfigEntry
 	exported := &struct {
 		ConnectTimeout string `json:",omitempty"`
+		RequestTimeout string `json:",omitempty"`
 		*Alias
 	}{
 		ConnectTimeout: e.ConnectTimeout.String(),
+		RequestTimeout: e.RequestTimeout.String(),
 		Alias:          (*Alias)(e),
 	}
 	if e.ConnectTimeout == 0 {
 		exported.ConnectTimeout = ""
+	}
+	if e.RequestTimeout == 0 {
+		exported.RequestTimeout = ""
 	}
 
 	return json.Marshal(exported)
@@ -840,20 +964,27 @@ func (e *ServiceResolverConfigEntry) UnmarshalJSON(data []byte) error {
 	type Alias ServiceResolverConfigEntry
 	aux := &struct {
 		ConnectTimeout string
+		RequestTimeout string
 		*Alias
 	}{
 		Alias: (*Alias)(e),
 	}
-	if err := lib.UnmarshalJSON(data, &aux); err != nil {
+	var err error
+	if err = lib.UnmarshalJSON(data, &aux); err != nil {
 		return err
 	}
-	var err error
+	var merr *multierror.Error
 	if aux.ConnectTimeout != "" {
 		if e.ConnectTimeout, err = time.ParseDuration(aux.ConnectTimeout); err != nil {
-			return err
+			merr = multierror.Append(merr, err)
 		}
 	}
-	return nil
+	if aux.RequestTimeout != "" {
+		if e.RequestTimeout, err = time.ParseDuration(aux.RequestTimeout); err != nil {
+			merr = multierror.Append(merr, err)
+		}
+	}
+	return merr.ErrorOrNil()
 }
 
 func (e *ServiceResolverConfigEntry) SubsetExists(name string) bool {
@@ -873,7 +1004,9 @@ func (e *ServiceResolverConfigEntry) IsDefault() bool {
 		e.Redirect == nil &&
 		len(e.Failover) == 0 &&
 		e.ConnectTimeout == 0 &&
-		e.LoadBalancer == nil
+		e.RequestTimeout == 0 &&
+		e.LoadBalancer == nil &&
+		e.PrioritizeByLocality == nil
 }
 
 func (e *ServiceResolverConfigEntry) GetKind() string {
@@ -904,6 +1037,11 @@ func (e *ServiceResolverConfigEntry) Normalize() error {
 
 	e.EnterpriseMeta.Normalize()
 
+	h, err := HashConfigEntry(e)
+	if err != nil {
+		return err
+	}
+	e.Hash = h
 	return nil
 }
 
@@ -944,6 +1082,10 @@ func (e *ServiceResolverConfigEntry) Validate() error {
 		return fmt.Errorf("DefaultSubset %q is not a valid subset", e.DefaultSubset)
 	}
 
+	if err := e.PrioritizeByLocality.validate(); err != nil {
+		return err
+	}
+
 	if e.Redirect != nil {
 		if !e.InDefaultPartition() && e.Redirect.Datacenter != "" {
 			return fmt.Errorf("Cross-datacenter redirect is only supported in the default partition")
@@ -954,17 +1096,34 @@ func (e *ServiceResolverConfigEntry) Validate() error {
 
 		r := e.Redirect
 
+		if err := r.ValidateEnterprise(); err != nil {
+			return fmt.Errorf("Redirect: %s", err.Error())
+		}
+
 		if len(e.Failover) > 0 {
 			return fmt.Errorf("Redirect and Failover cannot both be set")
 		}
 
 		// TODO(rb): prevent subsets and default subsets from being defined?
 
-		if r.Service == "" && r.ServiceSubset == "" && r.Namespace == "" && r.Partition == "" && r.Datacenter == "" {
+		if r.isEmpty() {
 			return fmt.Errorf("Redirect is empty")
 		}
 
-		if r.Service == "" {
+		switch {
+		case r.SamenessGroup != "" && r.ServiceSubset != "":
+			return fmt.Errorf("Redirect.SamenessGroup cannot be set with Redirect.ServiceSubset")
+		case r.SamenessGroup != "" && r.Partition != "":
+			return fmt.Errorf("Redirect.Partition cannot be set with Redirect.SamenessGroup")
+		case r.SamenessGroup != "" && r.Datacenter != "":
+			return fmt.Errorf("Redirect.SamenessGroup cannot be set with Redirect.Datacenter")
+		case r.Peer != "" && r.ServiceSubset != "":
+			return fmt.Errorf("Redirect.Peer cannot be set with Redirect.ServiceSubset")
+		case r.Peer != "" && r.Partition != "":
+			return fmt.Errorf("Redirect.Partition cannot be set with Redirect.Peer")
+		case r.Peer != "" && r.Datacenter != "":
+			return fmt.Errorf("Redirect.Peer cannot be set with Redirect.Datacenter")
+		case r.Service == "":
 			if r.ServiceSubset != "" {
 				return fmt.Errorf("Redirect.ServiceSubset defined without Redirect.Service")
 			}
@@ -974,9 +1133,12 @@ func (e *ServiceResolverConfigEntry) Validate() error {
 			if r.Partition != "" {
 				return fmt.Errorf("Redirect.Partition defined without Redirect.Service")
 			}
-		} else if r.Service == e.Name {
-			if r.ServiceSubset != "" && !isSubset(r.ServiceSubset) {
-				return fmt.Errorf("Redirect.ServiceSubset %q is not a valid subset of %q", r.ServiceSubset, r.Service)
+			if r.Peer != "" {
+				return fmt.Errorf("Redirect.Peer defined without Redirect.Service")
+			}
+		case r.ServiceSubset != "" && (r.Service == "" || r.Service == e.Name):
+			if !isSubset(r.ServiceSubset) {
+				return fmt.Errorf("Redirect.ServiceSubset %q is not a valid subset of %q", r.ServiceSubset, e.Name)
 			}
 		}
 	}
@@ -988,18 +1150,78 @@ func (e *ServiceResolverConfigEntry) Validate() error {
 				return fmt.Errorf("Cross-datacenter failover is only supported in the default partition")
 			}
 
-			if subset != "*" && !isSubset(subset) {
-				return fmt.Errorf("Bad Failover[%q]: not a valid subset", subset)
+			errorPrefix := fmt.Sprintf("Bad Failover[%q]: ", subset)
+
+			if err := f.ValidateEnterprise(); err != nil {
+				return fmt.Errorf(errorPrefix + err.Error())
 			}
 
-			if f.Service == "" && f.ServiceSubset == "" && f.Namespace == "" && len(f.Datacenters) == 0 {
-				return fmt.Errorf("Bad Failover[%q] one of Service, ServiceSubset, Namespace, or Datacenters is required", subset)
+			if subset != "*" && !isSubset(subset) {
+				return fmt.Errorf(errorPrefix + "not a valid subset subset")
+			}
+
+			if f.isEmpty() {
+				return fmt.Errorf(errorPrefix + "one of Service, ServiceSubset, Namespace, Targets, SamenessGroup, or Datacenters is required")
+			}
+
+			if err := f.Policy.ValidateEnterprise(); err != nil {
+				return fmt.Errorf("Bad Failover[%q]: %s", subset, err)
+			}
+
+			if err := f.Policy.validate(); err != nil {
+				return fmt.Errorf("Bad Failover[%q]: %w", subset, err)
 			}
 
 			if f.ServiceSubset != "" {
 				if f.Service == "" || f.Service == e.Name {
 					if !isSubset(f.ServiceSubset) {
-						return fmt.Errorf("Bad Failover[%q].ServiceSubset %q is not a valid subset of %q", subset, f.ServiceSubset, f.Service)
+						return fmt.Errorf("%sServiceSubset %q is not a valid subset of %q", errorPrefix, f.ServiceSubset, f.Service)
+					}
+				}
+			}
+
+			if f.SamenessGroup != "" {
+				switch {
+				case len(f.Datacenters) > 0:
+					return fmt.Errorf("Bad Failover[%q]: SamenessGroup cannot be set with Datacenters", subset)
+				case f.ServiceSubset != "":
+					return fmt.Errorf("Bad Failover[%q]: SamenessGroup cannot be set with ServiceSubset", subset)
+				case len(f.Targets) > 0:
+					return fmt.Errorf("Bad Failover[%q]: SamenessGroup cannot be set with Targets", subset)
+				}
+			}
+
+			if len(f.Datacenters) != 0 && len(f.Targets) != 0 {
+				return fmt.Errorf("Bad Failover[%q]: Targets cannot be set with Datacenters", subset)
+			}
+
+			if f.ServiceSubset != "" && len(f.Targets) != 0 {
+				return fmt.Errorf("Bad Failover[%q]: Targets cannot be set with ServiceSubset", subset)
+			}
+
+			if f.Service != "" && len(f.Targets) != 0 {
+				return fmt.Errorf("Bad Failover[%q]: Targets cannot be set with Service", subset)
+			}
+
+			for i, target := range f.Targets {
+				errorPrefix := fmt.Sprintf("Bad Failover[%q].Targets[%d]: ", subset, i)
+
+				if err := target.ValidateEnterprise(); err != nil {
+					return fmt.Errorf(errorPrefix + err.Error())
+				}
+
+				switch {
+				case target.Peer != "" && target.ServiceSubset != "":
+					return fmt.Errorf(errorPrefix + "Peer cannot be set with ServiceSubset")
+				case target.Peer != "" && target.Partition != "":
+					return fmt.Errorf(errorPrefix + "Partition cannot be set with Peer")
+				case target.Peer != "" && target.Datacenter != "":
+					return fmt.Errorf(errorPrefix + "Peer cannot be set with Datacenter")
+				case target.Partition != "" && target.Datacenter != "":
+					return fmt.Errorf(errorPrefix + "Partition cannot be set with Datacenter")
+				case target.ServiceSubset != "" && (target.Service == "" || target.Service == e.Name):
+					if !isSubset(target.ServiceSubset) {
+						return fmt.Errorf("%sServiceSubset %q is not a valid subset of %q", errorPrefix, target.ServiceSubset, e.Name)
 					}
 				}
 			}
@@ -1014,6 +1236,10 @@ func (e *ServiceResolverConfigEntry) Validate() error {
 
 	if e.ConnectTimeout < 0 {
 		return fmt.Errorf("Bad ConnectTimeout '%s', must be >= 0", e.ConnectTimeout)
+	}
+
+	if e.RequestTimeout < 0 {
+		return fmt.Errorf("Bad RequestTimeout '%s', must be >= 0", e.RequestTimeout)
 	}
 
 	if e.LoadBalancer != nil {
@@ -1107,9 +1333,24 @@ func (e *ServiceResolverConfigEntry) ListRelatedServices() []ServiceID {
 
 	if len(e.Failover) > 0 {
 		for _, failover := range e.Failover {
-			failoverID := NewServiceID(defaultIfEmpty(failover.Service, e.Name), failover.GetEnterpriseMeta(&e.EnterpriseMeta))
-			if failoverID != svcID {
-				found[failoverID] = struct{}{}
+			if len(failover.Targets) == 0 {
+				failoverID := NewServiceID(defaultIfEmpty(failover.Service, e.Name), failover.GetEnterpriseMeta(&e.EnterpriseMeta))
+				if failoverID != svcID {
+					found[failoverID] = struct{}{}
+				}
+				continue
+			}
+
+			for _, target := range failover.Targets {
+				// We can't know about related services on cluster peers.
+				if target.Peer != "" {
+					continue
+				}
+
+				failoverID := NewServiceID(defaultIfEmpty(target.Service, e.Name), target.GetEnterpriseMeta(failover.GetEnterpriseMeta(&e.EnterpriseMeta)))
+				if failoverID != svcID {
+					found[failoverID] = struct{}{}
+				}
 			}
 		}
 	}
@@ -1171,13 +1412,52 @@ type ServiceResolverRedirect struct {
 	// Datacenter is the datacenter to resolve the service from instead of the
 	// current one (optional).
 	Datacenter string `json:",omitempty"`
+
+	// Peer is the name of the cluster peer to resolve the service from instead
+	// of the current one (optional).
+	Peer string `json:",omitempty"`
+
+	// SamenessGroup is the name of the sameness group to resolve the service from instead
+	// of the local partition.
+	SamenessGroup string `json:",omitempty"`
+}
+
+// ToSamenessDiscoveryTargetOpts returns the options required for sameness failover and redirects.
+// These operations should preserve the service name and namespace.
+func (r *ServiceResolverConfigEntry) ToSamenessDiscoveryTargetOpts() DiscoveryTargetOpts {
+	return DiscoveryTargetOpts{
+		Service:   r.Name,
+		Namespace: r.NamespaceOrDefault(),
+		Partition: r.PartitionOrDefault(),
+	}
+}
+
+func (r *ServiceResolverRedirect) ToDiscoveryTargetOpts() DiscoveryTargetOpts {
+	return DiscoveryTargetOpts{
+		Service:       r.Service,
+		ServiceSubset: r.ServiceSubset,
+		Namespace:     r.Namespace,
+		Partition:     r.Partition,
+		Datacenter:    r.Datacenter,
+		Peer:          r.Peer,
+	}
+}
+
+func (r *ServiceResolverRedirect) isEmpty() bool {
+	return r.Service == "" &&
+		r.ServiceSubset == "" &&
+		r.Namespace == "" &&
+		r.Partition == "" &&
+		r.Datacenter == "" &&
+		r.Peer == "" &&
+		r.SamenessGroup == ""
 }
 
 // There are some restrictions on what is allowed in here:
 //
-// - Service, ServiceSubset, Namespace, and Datacenters cannot all be
-//   empty at once.
-//
+// - Service, ServiceSubset, Namespace, Datacenters, and Targets cannot all be
+// empty at once. When Targets is defined, the other fields should not be
+// populated.
 type ServiceResolverFailover struct {
 	// Service is the service to resolve instead of the default as the failover
 	// group of instances (optional).
@@ -1205,6 +1485,96 @@ type ServiceResolverFailover struct {
 	//
 	// This is a DESTINATION during failover.
 	Datacenters []string `json:",omitempty"`
+
+	// Targets specifies a fixed list of failover targets to try. We never try a
+	// target multiple times, so those are subtracted from this list before
+	// proceeding.
+	//
+	// This is a DESTINATION during failover.
+	Targets []ServiceResolverFailoverTarget `json:",omitempty"`
+
+	// Policy specifies the exact mechanism used for failover.
+	Policy *ServiceResolverFailoverPolicy `json:",omitempty"`
+
+	// SamenessGroup specifies the sameness group to failover to.
+	SamenessGroup string `json:",omitempty"`
+}
+
+func (f *ServiceResolverFailover) ToDiscoveryTargetOpts() DiscoveryTargetOpts {
+	return DiscoveryTargetOpts{
+		Service:       f.Service,
+		ServiceSubset: f.ServiceSubset,
+		Namespace:     f.Namespace,
+	}
+}
+
+func (f *ServiceResolverFailover) isEmpty() bool {
+	return f.Service == "" &&
+		f.ServiceSubset == "" &&
+		f.Namespace == "" &&
+		len(f.Datacenters) == 0 &&
+		len(f.Targets) == 0 &&
+		f.SamenessGroup == ""
+}
+
+type ServiceResolverFailoverPolicy struct {
+	// Mode specifies the type of failover that will be performed. Valid values are
+	// "sequential", "" (equivalent to "sequential") and "order-by-locality".
+	Mode    string   `json:",omitempty"`
+	Regions []string `json:",omitempty"`
+}
+
+func (fp *ServiceResolverFailoverPolicy) validate() error {
+	if fp == nil {
+		return nil
+	}
+
+	switch fp.Mode {
+	case "":
+	case "sequential":
+	case "order-by-locality":
+	default:
+		return fmt.Errorf("Failover-policy mode must be one of '', 'sequential', or 'order-by-locality'")
+	}
+	return nil
+}
+
+type ServiceResolverPrioritizeByLocality struct {
+	// Mode specifies the type of prioritization that will be performed
+	// when selecting nodes in the local partition.
+	// Valid values are: "" (default "none"), "none", and "failover".
+	Mode string `json:",omitempty"`
+}
+
+type ServiceResolverFailoverTarget struct {
+	// Service specifies the name of the service to try during failover.
+	Service string `json:",omitempty"`
+
+	// ServiceSubset specifies the service subset to try during failover.
+	ServiceSubset string `json:",omitempty" alias:"service_subset"`
+
+	// Partition specifies the partition to try during failover.
+	Partition string `json:",omitempty"`
+
+	// Namespace specifies the namespace to try during failover.
+	Namespace string `json:",omitempty"`
+
+	// Datacenter specifies the datacenter to try during failover.
+	Datacenter string `json:",omitempty"`
+
+	// Peer specifies the name of the cluster peer to try during failover.
+	Peer string `json:",omitempty"`
+}
+
+func (t *ServiceResolverFailoverTarget) ToDiscoveryTargetOpts() DiscoveryTargetOpts {
+	return DiscoveryTargetOpts{
+		Service:       t.Service,
+		ServiceSubset: t.ServiceSubset,
+		Namespace:     t.Namespace,
+		Partition:     t.Partition,
+		Datacenter:    t.Datacenter,
+		Peer:          t.Peer,
+	}
 }
 
 // LoadBalancer determines the load balancing policy and configuration for services

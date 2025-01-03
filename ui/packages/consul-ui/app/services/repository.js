@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Service, { inject as service } from '@ember/service';
 import { assert } from '@ember/debug';
 import { typeOf } from '@ember/utils';
@@ -70,7 +75,7 @@ export default class RepositoryService extends Service {
     // inspect the permissions for this segment/slug remotely, if we have zero
     // permissions fire a fake 403 so we don't even request the model/resource
     if (params.resources.length > 0) {
-      const resource = params.resources.find(item => item.Access === access);
+      const resource = params.resources.find((item) => item.Access === access);
       if (resource && resource.Allow === false) {
         // TODO: Here we temporarily make a hybrid HTTPError/ember-data HTTP error
         // we should eventually use HTTPError's everywhere
@@ -108,13 +113,24 @@ export default class RepositoryService extends Service {
         return false;
       }
     }
+
+    // We were seeing issues where services were all being unloaded after visiting
+    // a peers imported services page. So if you viewes services -> peered imported services -> services
+    // only the peered services would remain as the others were all unloaded. Not certain if
+    // we should be doing any manual reconciling as it is. Not enough historical context
+    // to determine that at this time.
+    //
+    // https://hashicorp.atlassian.net/browse/NET-6900
+    if (this.env.var('CONSUL_PEERINGS_ENABLED') && this.getModelName() === 'service') {
+      return false;
+    }
     return true;
   }
 
   reconcile(meta = {}, params = {}, configuration = {}) {
     // unload anything older than our current sync date/time
     if (typeof meta.date !== 'undefined') {
-      this.store.peekAll(this.getModelName()).forEach(item => {
+      this.store.peekAll(this.getModelName()).forEach((item) => {
         const date = get(item, 'SyncTime');
         if (
           !item.isDeleted &&
@@ -138,7 +154,7 @@ export default class RepositoryService extends Service {
 
   cached(params) {
     const entries = Object.entries(params);
-    return this.store.peekAll(this.getModelName()).filter(item => {
+    return this.store.peekAll(this.getModelName()).filter((item) => {
       return entries.every(([key, value]) => item[key] === value);
     });
   }
@@ -230,7 +246,7 @@ export default class RepositoryService extends Service {
     if (typeOf(item) === 'object') {
       item = this.store.peekRecord(this.getModelName(), item[this.getPrimaryKey()]);
     }
-    return item.destroyRecord().then(item => {
+    return item.destroyRecord().then((item) => {
       return this.store.unloadRecord(item);
     });
   }

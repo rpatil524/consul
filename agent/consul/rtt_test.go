@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package consul
 
 import (
@@ -7,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/agent/structs"
-	"github.com/hashicorp/consul/lib"
-	"github.com/hashicorp/consul/testrpc"
-
-	"github.com/hashicorp/consul-net-rpc/net-rpc-msgpackrpc"
+	msgpackrpc "github.com/hashicorp/consul-net-rpc/net-rpc-msgpackrpc"
 	"github.com/hashicorp/consul-net-rpc/net/rpc"
+
+	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/internal/gossip/librtt"
+	"github.com/hashicorp/consul/testrpc"
 )
 
 // verifyNodeSort makes sure the order of the nodes in the slice is the same as
@@ -73,10 +76,9 @@ func verifyCheckServiceNodeSort(t *testing.T, nodes structs.CheckServiceNodes, e
 //
 // Here's the layout of the nodes:
 //
-//       node3 node2 node5                         node4       node1
-//   |     |     |     |     |     |     |     |     |     |     |
-//   0     1     2     3     4     5     6     7     8     9     10  (ms)
-//
+//	    node3 node2 node5                         node4       node1
+//	|     |     |     |     |     |     |     |     |     |     |
+//	0     1     2     3     4     5     6     7     8     9     10  (ms)
 func seedCoordinates(t *testing.T, codec rpc.ClientCodec, server *Server) {
 	// Register some nodes.
 	for i := 0; i < 5; i++ {
@@ -96,27 +98,27 @@ func seedCoordinates(t *testing.T, codec rpc.ClientCodec, server *Server) {
 		{
 			Datacenter: "dc1",
 			Node:       "node1",
-			Coord:      lib.GenerateCoordinate(10 * time.Millisecond),
+			Coord:      librtt.GenerateCoordinate(10 * time.Millisecond),
 		},
 		{
 			Datacenter: "dc1",
 			Node:       "node2",
-			Coord:      lib.GenerateCoordinate(2 * time.Millisecond),
+			Coord:      librtt.GenerateCoordinate(2 * time.Millisecond),
 		},
 		{
 			Datacenter: "dc1",
 			Node:       "node3",
-			Coord:      lib.GenerateCoordinate(1 * time.Millisecond),
+			Coord:      librtt.GenerateCoordinate(1 * time.Millisecond),
 		},
 		{
 			Datacenter: "dc1",
 			Node:       "node4",
-			Coord:      lib.GenerateCoordinate(8 * time.Millisecond),
+			Coord:      librtt.GenerateCoordinate(8 * time.Millisecond),
 		},
 		{
 			Datacenter: "dc1",
 			Node:       "node5",
-			Coord:      lib.GenerateCoordinate(3 * time.Millisecond),
+			Coord:      librtt.GenerateCoordinate(3 * time.Millisecond),
 		},
 	}
 

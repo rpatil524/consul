@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package consul
 
 import (
@@ -25,6 +28,10 @@ var clientACLCacheConfig = &structs.ACLCachesConfig{
 type clientACLResolverBackend struct {
 	// TODO: un-embed
 	*Client
+}
+
+func (c *clientACLResolverBackend) IsServerManagementToken(_ string) bool {
+	return false
 }
 
 func (c *clientACLResolverBackend) ACLDatacenter() string {

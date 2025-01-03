@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
@@ -10,9 +13,12 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/serf/serf"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/config"
+	"github.com/hashicorp/consul/agent/consul"
+	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/logging"
@@ -98,7 +104,7 @@ func (s *HTTPHandlers) UINodes(resp http.ResponseWriter, req *http.Request) (int
 	var out structs.IndexedNodeDump
 	defer setMeta(resp, &out.QueryMeta)
 RPC:
-	if err := s.agent.RPC("Internal.NodeDump", &args, &out); err != nil {
+	if err := s.agent.RPC(req.Context(), "Internal.NodeDump", &args, &out); err != nil {
 		// Retry the request allowing stale data if no leader
 		if strings.Contains(err.Error(), structs.ErrNoLeader.Error()) && !args.AllowStale {
 			args.AllowStale = true
@@ -107,7 +113,18 @@ RPC:
 		return nil, err
 	}
 
+	// Get version info for all serf members into a map of key-address,value-version.
+	// This logic of calling 'AgentMembersMapAddrVer()' and inserting version info in this func
+	// can be discarded in future releases ( may be after 3 or 4 minor releases),
+	// when all the nodes are registered with consul-version in nodemeta.
+	var err error
+	mapAddrVer, err := AgentMembersMapAddrVer(s, req)
+	if err != nil {
+		return nil, err
+	}
+
 	// Use empty list instead of nil
+	// Also check if consul-version exists in Meta, else add it
 	for _, info := range out.Dump {
 		if info.Services == nil {
 			info.Services = make([]*structs.NodeService, 0)
@@ -115,12 +132,24 @@ RPC:
 		if info.Checks == nil {
 			info.Checks = make([]*structs.HealthCheck, 0)
 		}
+		// Check if Node Meta - 'consul-version' already exists by virtue of adding
+		// 'consul-version' during node registration itself.
+		// If not, get it from mapAddrVer.
+		if _, ok := info.Meta[structs.MetaConsulVersion]; !ok {
+			if _, okver := mapAddrVer[info.Address]; okver {
+				if info.Meta == nil {
+					info.Meta = make(map[string]string)
+				}
+				info.Meta[structs.MetaConsulVersion] = mapAddrVer[info.Address]
+			}
+		}
 	}
 	if out.Dump == nil {
 		out.Dump = make(structs.NodeDump, 0)
 	}
 
 	// Use empty list instead of nil
+	// Also check if consul-version exists in Meta, else add it
 	for _, info := range out.ImportedDump {
 		if info.Services == nil {
 			info.Services = make([]*structs.NodeService, 0)
@@ -128,9 +157,61 @@ RPC:
 		if info.Checks == nil {
 			info.Checks = make([]*structs.HealthCheck, 0)
 		}
+		// Check if Node Meta - 'consul-version' already exists by virtue of adding
+		// 'consul-version' during node registration itself.
+		// If not, get it from mapAddrVer.
+		if _, ok := info.Meta[structs.MetaConsulVersion]; !ok {
+			if _, okver := mapAddrVer[info.Address]; okver {
+				if info.Meta == nil {
+					info.Meta = make(map[string]string)
+				}
+				info.Meta[structs.MetaConsulVersion] = mapAddrVer[info.Address]
+			}
+		}
 	}
 
 	return append(out.Dump, out.ImportedDump...), nil
+}
+
+// AgentMembersMapAddrVer is used to get version info from  all serf members into a
+// map of key-address,value-version.
+func AgentMembersMapAddrVer(s *HTTPHandlers, req *http.Request) (map[string]string, error) {
+	var members []serf.Member
+
+	//Get WAN Members
+	wanMembers := s.agent.WANMembers()
+
+	//Get LAN Members
+	//Get the request partition and default to that of the agent.
+	entMeta := s.agent.AgentEnterpriseMeta()
+	if err := s.parseEntMetaPartition(req, entMeta); err != nil {
+		return nil, err
+	}
+	filter := consul.LANMemberFilter{
+		Partition: entMeta.PartitionOrDefault(),
+	}
+	if acl.IsDefaultPartition(filter.Partition) {
+		filter.AllSegments = true
+	}
+
+	lanMembers, err := s.agent.delegate.LANMembers(filter)
+	if err != nil {
+		return nil, err
+	}
+
+	//aggregate members
+	members = append(wanMembers, lanMembers...)
+
+	//create a map with key as IPv4 address and value as consul-version
+	mapAddrVer := make(map[string]string, len(members))
+	for i := range members {
+		buildVersion, err := metadata.Build(&members[i])
+		if err == nil {
+			mapAddrVer[members[i].Addr.String()] = buildVersion.String()
+		}
+	}
+
+	return mapAddrVer, nil
 }
 
 // UINodeInfo is used to get info on a single node in a given datacenter. We return a
@@ -160,12 +241,22 @@ func (s *HTTPHandlers) UINodeInfo(resp http.ResponseWriter, req *http.Request) (
 	var out structs.IndexedNodeDump
 	defer setMeta(resp, &out.QueryMeta)
 RPC:
-	if err := s.agent.RPC("Internal.NodeInfo", &args, &out); err != nil {
+	if err := s.agent.RPC(req.Context(), "Internal.NodeInfo", &args, &out); err != nil {
 		// Retry the request allowing stale data if no leader
 		if strings.Contains(err.Error(), structs.ErrNoLeader.Error()) && !args.AllowStale {
 			args.AllowStale = true
 			goto RPC
 		}
+		return nil, err
+	}
+
+	// Get version info for all serf members into a map of key-address,value-version.
+	// This logic of calling 'AgentMembersMapAddrVer()' and inserting version info in this func
+	// can be discarded in future releases ( may be after 3 or 4 minor releases),
+	// when all the nodes are registered with consul-version in nodemeta.
+	var err error
+	mapAddrVer, err := AgentMembersMapAddrVer(s, req)
+	if err != nil {
 		return nil, err
 	}
 
@@ -177,6 +268,17 @@ RPC:
 		}
 		if info.Checks == nil {
 			info.Checks = make([]*structs.HealthCheck, 0)
+		}
+		// Check if Node Meta - 'consul-version' already exists by virtue of adding
+		// 'consul-version' during node registration itself.
+		// If not, get it from mapAddrVer.
+		if _, ok := info.Meta[structs.MetaConsulVersion]; !ok {
+			if _, okver := mapAddrVer[info.Address]; okver {
+				if info.Meta == nil {
+					info.Meta = make(map[string]string)
+				}
+				info.Meta[structs.MetaConsulVersion] = mapAddrVer[info.Address]
+			}
 		}
 		return info, nil
 	}
@@ -196,7 +298,7 @@ func (s *HTTPHandlers) UICatalogOverview(resp http.ResponseWriter, req *http.Req
 
 	// Make the RPC request
 	var out structs.CatalogSummary
-	if err := s.agent.RPC("Internal.CatalogOverview", &args, &out); err != nil {
+	if err := s.agent.RPC(req.Context(), "Internal.CatalogOverview", &args, &out); err != nil {
 		return nil, err
 	}
 
@@ -211,7 +313,9 @@ func (s *HTTPHandlers) UIServices(resp http.ResponseWriter, req *http.Request) (
 	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
 		return nil, nil
 	}
-
+	if peer := req.URL.Query().Get("peer"); peer != "" {
+		args.PeerName = peer
+	}
 	if err := s.parseEntMeta(req, &args.EnterpriseMeta); err != nil {
 		return nil, err
 	}
@@ -222,7 +326,7 @@ func (s *HTTPHandlers) UIServices(resp http.ResponseWriter, req *http.Request) (
 	var out structs.IndexedNodesWithGateways
 	defer setMeta(resp, &out.QueryMeta)
 RPC:
-	if err := s.agent.RPC("Internal.ServiceDump", &args, &out); err != nil {
+	if err := s.agent.RPC(req.Context(), "Internal.ServiceDump", &args, &out); err != nil {
 		// Retry the request allowing stale data if no leader
 		if strings.Contains(err.Error(), structs.ErrNoLeader.Error()) && !args.AllowStale {
 			args.AllowStale = true
@@ -291,7 +395,7 @@ func (s *HTTPHandlers) UIGatewayServicesNodes(resp http.ResponseWriter, req *htt
 	var out structs.IndexedServiceDump
 	defer setMeta(resp, &out.QueryMeta)
 RPC:
-	if err := s.agent.RPC("Internal.GatewayServiceDump", &args, &out); err != nil {
+	if err := s.agent.RPC(req.Context(), "Internal.GatewayServiceDump", &args, &out); err != nil {
 		// Retry the request allowing stale data if no leader
 		if strings.Contains(err.Error(), structs.ErrNoLeader.Error()) && !args.AllowStale {
 			args.AllowStale = true
@@ -334,7 +438,7 @@ func (s *HTTPHandlers) UIServiceTopology(resp http.ResponseWriter, req *http.Req
 	args.ServiceKind = structs.ServiceKind(kind[0])
 
 	switch args.ServiceKind {
-	case structs.ServiceKindTypical, structs.ServiceKindIngressGateway:
+	case structs.ServiceKindTypical, structs.ServiceKindIngressGateway, structs.ServiceKindAPIGateway:
 		// allowed
 	default:
 		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: fmt.Sprintf("Unsupported service kind %q", args.ServiceKind)}
@@ -344,7 +448,7 @@ func (s *HTTPHandlers) UIServiceTopology(resp http.ResponseWriter, req *http.Req
 	var out structs.IndexedServiceTopology
 	defer setMeta(resp, &out.QueryMeta)
 RPC:
-	if err := s.agent.RPC("Internal.ServiceTopology", &args, &out); err != nil {
+	if err := s.agent.RPC(req.Context(), "Internal.ServiceTopology", &args, &out); err != nil {
 		// Retry the request allowing stale data if no leader
 		if strings.Contains(err.Error(), structs.ErrNoLeader.Error()) && !args.AllowStale {
 			args.AllowStale = true
@@ -459,11 +563,25 @@ func summarizeServices(dump structs.ServiceDump, cfg *config.RuntimeConfig, dc s
 		sum := getService(psn)
 
 		svc := csn.Service
-		sum.Nodes = append(sum.Nodes, csn.Node.Node)
+
+		found := false
+		for _, existing := range sum.Nodes {
+			if existing == csn.Node.Node {
+				found = true
+				break
+			}
+		}
+		if !found {
+			sum.Nodes = append(sum.Nodes, csn.Node.Node)
+		}
+
 		sum.Kind = svc.Kind
 		sum.Datacenter = csn.Node.Datacenter
 		sum.InstanceCount += 1
-		sum.ConnectNative = svc.Connect.Native
+		// Consider a service connect native once at least one instance is
+		if svc.Connect.Native {
+			sum.ConnectNative = svc.Connect.Native
+		}
 		if svc.Kind == structs.ServiceKindConnectProxy {
 			sn := structs.NewServiceName(svc.Proxy.DestinationServiceName, &svc.EnterpriseMeta)
 			psn := structs.PeeredServiceName{Peer: peerName, ServiceName: sn}
@@ -551,7 +669,7 @@ func prepSummaryOutput(summaries map[structs.PeeredServiceName]*ServiceSummary, 
 				sum.ChecksCritical++
 			}
 		}
-		if excludeSidecars && sum.Kind != structs.ServiceKindTypical && sum.Kind != structs.ServiceKindIngressGateway {
+		if excludeSidecars && sum.Kind != structs.ServiceKindTypical && sum.Kind != structs.ServiceKindIngressGateway && sum.Kind != structs.ServiceKindAPIGateway {
 			continue
 		}
 		resp = append(resp, sum)
@@ -629,7 +747,7 @@ func (s *HTTPHandlers) UIGatewayIntentions(resp http.ResponseWriter, req *http.R
 	var reply structs.IndexedIntentions
 
 	defer setMeta(resp, &reply.QueryMeta)
-	if err := s.agent.RPC("Internal.GatewayIntentions", args, &reply); err != nil {
+	if err := s.agent.RPC(req.Context(), "Internal.GatewayIntentions", args, &reply); err != nil {
 		return nil, err
 	}
 
@@ -769,6 +887,7 @@ func (s *HTTPHandlers) UIMetricsProxy(resp http.ResponseWriter, req *http.Reques
 		Director: func(r *http.Request) {
 			r.URL = u
 		},
+		Transport: s.proxyTransport,
 		ErrorLog: log.StandardLogger(&hclog.StandardLoggerOptions{
 			InferLevels: true,
 		}),
@@ -776,4 +895,50 @@ func (s *HTTPHandlers) UIMetricsProxy(resp http.ResponseWriter, req *http.Reques
 
 	proxy.ServeHTTP(resp, req)
 	return nil, nil
+}
+
+// UIExportedServices is used to list the exported services to a given peer. We return a
+// barebones ServiceListingSummary which only contains the name and enterprise meta of a service.
+// Currently, the request and response mirror UIServices but the API may change in the future.
+func (s *HTTPHandlers) UIExportedServices(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	// Parse arguments
+	args := structs.ServiceDumpRequest{}
+	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
+		return nil, nil
+	}
+	if peer := req.URL.Query().Get("peer"); peer != "" {
+		args.PeerName = peer
+	}
+	if err := s.parseEntMeta(req, &args.EnterpriseMeta); err != nil {
+		return nil, err
+	}
+
+	// Make the RPC request
+	var out structs.IndexedServiceList
+	defer setMeta(resp, &out.QueryMeta)
+RPC:
+	if err := s.agent.RPC(req.Context(), "Internal.ExportedServicesForPeer", &args, &out); err != nil {
+		// Retry the request allowing stale data if no leader
+		if strings.Contains(err.Error(), structs.ErrNoLeader.Error()) && !args.AllowStale {
+			args.AllowStale = true
+			goto RPC
+		}
+		return nil, err
+	}
+	// Ensure at least a zero length slice
+	result := make([]*ServiceListingSummary, 0)
+	for _, svc := range out.Services {
+		// We synthesize a minimal summary for the frontend.
+		// The shape of the data may change in the future but
+		// currently only the service name is required.
+		sum := ServiceListingSummary{
+			ServiceSummary: ServiceSummary{
+				Name:           svc.Name,
+				EnterpriseMeta: svc.EnterpriseMeta,
+				Datacenter:     args.Datacenter,
+			},
+		}
+		result = append(result, &sum)
+	}
+	return result, nil
 }

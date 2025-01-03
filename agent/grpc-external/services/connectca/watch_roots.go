@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package connectca
 
 import (
@@ -32,7 +35,10 @@ func (s *Server) WatchRoots(_ *pbconnectca.WatchRootsRequest, serverStream pbcon
 	logger.Trace("starting stream")
 	defer logger.Trace("stream closed")
 
-	token := external.TokenFromContext(serverStream.Context())
+	options, err := external.QueryOptionsFromContext(serverStream.Context())
+	if err != nil {
+		return err
+	}
 
 	// Serve the roots from an EventPublisher subscription. If the subscription is
 	// closed due to an ACL change, we'll attempt to re-authorize and resume it to
@@ -40,8 +46,8 @@ func (s *Server) WatchRoots(_ *pbconnectca.WatchRootsRequest, serverStream pbcon
 	var idx uint64
 	for {
 		var err error
-		idx, err = s.serveRoots(token, idx, serverStream, logger)
-		if errors.Is(err, stream.ErrSubForceClosed) {
+		idx, err = s.serveRoots(options.Token, idx, serverStream, logger)
+		if errors.Is(err, stream.ErrSubForceClosed) || errors.Is(err, stream.ErrACLChanged) {
 			logger.Trace("subscription force-closed due to an ACL change or snapshot restore, will attempt to re-auth and resume")
 		} else {
 			return err
@@ -55,7 +61,7 @@ func (s *Server) serveRoots(
 	serverStream pbconnectca.ConnectCAService_WatchRootsServer,
 	logger hclog.Logger,
 ) (uint64, error) {
-	if err := s.authorize(token); err != nil {
+	if err := external.RequireAnyValidACLToken(s.ACLResolver, token); err != nil {
 		return 0, err
 	}
 
@@ -84,7 +90,7 @@ func (s *Server) serveRoots(
 	for {
 		event, err := sub.Next(serverStream.Context())
 		switch {
-		case errors.Is(err, stream.ErrSubForceClosed):
+		case errors.Is(err, stream.ErrSubForceClosed) || errors.Is(err, stream.ErrACLChanged):
 			// If the subscription was closed because the state store was abandoned (e.g.
 			// following a snapshot restore) reset idx to ensure we don't skip over the
 			// new store's events.
