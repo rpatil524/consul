@@ -1,4 +1,17 @@
-export default function(visitable, clickable, text, attribute, present, collection, popoverSelect) {
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+export default function (
+  visitable,
+  clickable,
+  text,
+  attribute,
+  present,
+  collection,
+  popoverSelect
+) {
   const service = {
     name: text('[data-test-service-name]'),
     service: clickable('a'),

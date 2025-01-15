@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package watch
 
 import (
@@ -8,7 +11,7 @@ import (
 )
 
 func TestMap(t *testing.T) {
-	m := NewMap[string, string]()
+	m := NewMap[string, testVal]()
 
 	// Set without init is a no-op
 	{
@@ -51,7 +54,7 @@ func TestMap(t *testing.T) {
 	{
 		got, ok := m.Get("hello")
 		require.True(t, ok)
-		require.Equal(t, "world", got)
+		require.Equal(t, "world", string(got))
 	}
 
 	// CancelWatch successful
@@ -76,15 +79,11 @@ func TestMap(t *testing.T) {
 }
 
 func TestMap_ForEach(t *testing.T) {
-	type testType struct {
-		s string
-	}
-
-	m := NewMap[string, any]()
-	inputs := map[string]any{
-		"hello": 13,
-		"foo":   struct{}{},
-		"bar":   &testType{s: "wow"},
+	m := NewMap[string, testVal]()
+	inputs := map[string]testVal{
+		"hello": "world",
+		"foo":   "bar",
+		"baz":   "bat",
 	}
 	for k, v := range inputs {
 		m.InitWatch(k, nil)
@@ -114,15 +113,11 @@ func TestMap_ForEach(t *testing.T) {
 }
 
 func TestMap_ForEachE(t *testing.T) {
-	type testType struct {
-		s string
-	}
-
-	m := NewMap[string, any]()
-	inputs := map[string]any{
-		"hello": 13,
-		"foo":   struct{}{},
-		"bar":   &testType{s: "wow"},
+	m := NewMap[string, testVal]()
+	inputs := map[string]testVal{
+		"hello": "world",
+		"foo":   "bar",
+		"baz":   "bat",
 	}
 	for k, v := range inputs {
 		m.InitWatch(k, nil)
@@ -152,3 +147,27 @@ func TestMap_ForEachE(t *testing.T) {
 		require.Errorf(t, err, "boo")
 	}
 }
+
+func TestMap_DeepCopy(t *testing.T) {
+	orig := NewMap[string, testVal]()
+	inputs := map[string]testVal{
+		"hello": "world",
+		"foo":   "bar",
+		"baz":   "bat",
+	}
+	for k, v := range inputs {
+		orig.InitWatch(k, nil)
+		orig.Set(k, v)
+	}
+	require.Equal(t, 3, orig.Len())
+
+	clone := orig.DeepCopy()
+	require.Equal(t, 3, clone.Len())
+
+	orig.CancelWatch("hello")
+	require.NotEqual(t, orig.Len(), clone.Len())
+}
+
+type testVal string
+
+func (tv testVal) DeepCopy() testVal { return tv }

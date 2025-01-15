@@ -1,5 +1,10 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 export default (css) => {
-/*%visually-hidden {*/
+  /*%visually-hidden {*/
   return css`
     @keyframes visually-hidden {
       100% {
@@ -14,5 +19,5 @@ export default (css) => {
       }
     }
   `;
-/*}*/
-}
+  /*}*/
+};

@@ -6,11 +6,6 @@ description: The /peering endpoints allow for managing cluster peerings.
 
 # Cluster Peering - HTTP API
 
-~> **Cluster peering is currently in technical preview:** Functionality associated
-with cluster peering is subject to change. You should never use the technical
-preview release in secure environments or production scenarios. Features in
-technical preview may have performance issues, scaling issues, and limited support.
-
 The functionality described here is available only in
 [Consul](https://www.hashicorp.com/products/consul/) version 1.13.0 and later.
 
@@ -23,14 +18,14 @@ This endpoint generates a peering token.
 | `POST`  | `/peering/token`     | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs/features/blocking),
-[consistency modes](/api-docs/features/consistency),
-[agent caching](/api-docs/features/caching), and
-[required ACLs](/api#authentication).
+[blocking queries](/consul/api-docs/features/blocking),
+[consistency modes](/consul/api-docs/features/consistency),
+[agent caching](/consul/api-docs/features/caching), and
+[required ACLs](/consul/api-docs/api-structure#authentication).
 
 | Blocking Queries | Consistency Modes | Agent Caching | ACL Required     |
 | ---------------- | ----------------- | ------------- | ---------------- |
-| `NO`             | `none`            | `none`        | `none`           |
+| `NO`             | `none`            | `none`        | `peering:write`  |
 
 ### JSON Request Body Schema
 
@@ -39,15 +34,10 @@ The table below shows this endpoint's support for
   and configuration entries such as `service-intentions`. This field must be a
   valid DNS hostname label.
 
-- `Partition` `(string: "")` - <EnterpriseAlert inline /> The admin partition that the
-  peering token is generated from. Uses `default` when not specified.
+@include 'http-api-body-options-partition.mdx'
 
-- `Datacenter` `(string: "")` - Specifies the datacenter where the peering token is generated. Defaults to the
-  agent's datacenter when not specified.
-
-- `Token` `(string: "")` - Specifies the ACL token to use in the request. Takes precedence
-  over the token specified in the `token` query parameter, `X-Consul-Token` request header,
-  and `CONSUL_HTTP_TOKEN` environment variable.
+- `ServerExternalAddresses` `([]string: <optional>)` - The addresses for the cluster that generates the peering token. Addresses take the form `{host or IP}:port`.
+You can specify one or more load balancers or external IPs that route external traffic to this cluster's Consul servers.
 
 - `Meta` `(map<string|string>: <optional>)` - Specifies KV metadata to associate with
   the peering. This parameter is not required and does not directly impact the cluster
@@ -93,14 +83,14 @@ This endpoint returns no data. Success or failure is indicated by the status
 code returned.
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs/features/blocking),
-[consistency modes](/api-docs/features/consistency),
-[agent caching](/api-docs/features/caching), and
-[required ACLs](/api#authentication).
+[blocking queries](/consul/api-docs/features/blocking),
+[consistency modes](/consul/api-docs/features/consistency),
+[agent caching](/consul/api-docs/features/caching), and
+[required ACLs](/consul/api-docs/api-structure#authentication).
 
 | Blocking Queries | Consistency Modes | Agent Caching | ACL Required     |
 | ---------------- | ----------------- | ------------- | ---------------- |
-| `NO`             | `none`            | `none`        | `none`           |
+| `NO`             | `none`            | `none`        | `peering:write`  |
 
 ### JSON Request Body Schema
 
@@ -109,19 +99,10 @@ The table below shows this endpoint's support for
   and configuration entries such as `service-intentions`. This field must be a
   valid DNS hostname label.
 
-- `Partition` `(string: "")` - <EnterpriseAlert inline /> The admin partition
-  that peers to the cluster that generated the peering token. Uses `default`
-  when not specified.
+@include 'http-api-body-options-partition.mdx'
 
 - `PeeringToken` `(string: <required>)` - The peering token fetched from the
   peer cluster.
-
-- `Datacenter` `(string: "")` - Specifies the datacenter where the peering token is generated. Defaults to the
-  agent's datacenter when not specified.
-
-- `Token` `(string: "")` - Specifies the ACL token to use in the request. Takes precedence
-  over the token specified in the `token` query parameter, `X-Consul-Token` request header,
-  and `CONSUL_HTTP_TOKEN` environment variable.
 
 - `Meta` `(map<string|string>: <optional>)` - Specifies KV metadata to associate with
   the peering. This parameter is not required and does not directly impact the cluster
@@ -163,14 +144,14 @@ This endpoint returns information about a peering connection for the specified p
 | `GET`  | `/peering/:name`   | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs/features/blocking),
-[consistency modes](/api-docs/features/consistency),
-[agent caching](/api-docs/features/caching), and
-[required ACLs](/api#authentication).
+[blocking queries](/consul/api-docs/features/blocking),
+[consistency modes](/consul/api-docs/features/consistency),
+[agent caching](/consul/api-docs/features/caching), and
+[required ACLs](/consul/api-docs/api-structure#authentication).
 
-| Blocking Queries | Consistency Modes | Agent Caching | ACL Required |
-| ---------------- | ----------------- | ------------- | ------------ |
-| `NO`             | `consistent`      | `none`        | `none`       |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required   |
+| ---------------- | ----------------- | ------------- | -------------- |
+| `YES`            | `consistent`      | `none`        | `peering:read` |
 
 ### Path Parameters
 
@@ -178,8 +159,7 @@ The table below shows this endpoint's support for
 
 ### Query Parameters
 
-- `partition` `(string: "")` <EnterpriseAlert inline /> - Specifies the partition of the peering
-  to read. If not specified will default to `default`.
+@include 'http-api-query-parms-partition.mdx'
 
 ### Sample Request
 
@@ -200,8 +180,25 @@ $ curl --header "X-Consul-Token: b23b3cad-5ea1-4413-919e-c76884b9ad60" \
     "PeerServerAddresses": [
         "10.0.0.1:8300"
     ],
+    "StreamStatus": {
+        "ImportedServices": [
+                  "db",
+            ],
+        "ExportedServices": [
+              "backend",
+              "frontend",
+              "web"
+        ],
+        "LastHeartbeat": "2023-12-13T06:31:28.227392Z",
+        "LastReceive": "2023-12-13T06:31:28.227392Z",
+        "LastSend": "2023-12-05T11:02:57.528676Z"
+    },
     "CreateIndex": 89,
-    "ModifyIndex": 89
+    "ModifyIndex": 89,
+    "Remote": {
+        "Partition": "",
+        "Datacenter": "east"
+    }
 }
 ```
 
@@ -219,20 +216,22 @@ This endpoint returns no data. Success or failure is indicated by the status
 code returned.
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs/features/blocking),
-[consistency modes](/api-docs/features/consistency),
-[agent caching](/api-docs/features/caching), and
-[required ACLs](/api#authentication).
+[blocking queries](/consul/api-docs/features/blocking),
+[consistency modes](/consul/api-docs/features/consistency),
+[agent caching](/consul/api-docs/features/caching), and
+[required ACLs](/consul/api-docs/api-structure#authentication).
 
-| Blocking Queries | Consistency Modes | Agent Caching | ACL Required  |
-| ---------------- | ----------------- | ------------- | ------------- |
-| `NO`             | `none`            | `none`        | `none`        |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required     |
+| ---------------- | ----------------- | ------------- | ---------------- |
+| `NO`             | `none`            | `none`        | `peering:write`  |
 
 ### Path Parameters
 
 - `name` `(string: <required>)` - Specifies the name of the peering to delete.
-- `partition` `(string: "")` <EnterpriseAlert inline /> - Specifies the partition of the peering
-  to delete. Uses `default` when not specified.
+
+### Query Parameters
+
+@include 'http-api-query-parms-partition.mdx'
 
 ### Sample Request
 
@@ -271,14 +270,18 @@ This endpoint lists all the peerings.
 | `GET`  | `/peerings`   | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs/features/blocking),
-[consistency modes](/api-docs/features/consistency),
-[agent caching](/api-docs/features/caching), and
-[required ACLs](/api#authentication).
+[blocking queries](/consul/api-docs/features/blocking),
+[consistency modes](/consul/api-docs/features/consistency),
+[agent caching](/consul/api-docs/features/caching), and
+[required ACLs](/consul/api-docs/api-structure#authentication).
 
-| Blocking Queries | Consistency Modes | Agent Caching | ACL Required  |
-| ---------------- | ----------------- | ------------- | ------------- |
-| `NO`             | `consistent`      | `none`        | `none`        |
+| Blocking Queries | Consistency Modes | Agent Caching        | ACL Required   |
+| ---------------- | ----------------- | -------------------- | -------------- |
+| `YES`            | `consistent`      | `background refresh` | `peering:read` |
+
+### Query Parameters
+
+@include 'http-api-query-parms-partition.mdx'
 
 ### Sample Request
 
@@ -301,8 +304,25 @@ $ curl --header "X-Consul-Token: 0137db51-5895-4c25-b6cd-d9ed992f4a52" \
         "PeerServerAddresses": [
             "10.0.0.1:8300"
         ],
+        "StreamStatus": {
+            "ImportedServices": [
+                  "db",
+            ],
+            "ExportedServices": [
+                  "backend",
+                  "frontend",
+                  "web"
+            ],
+            "LastHeartbeat": "2023-12-13T06:31:28.227392Z",
+            "LastReceive": "2023-12-13T06:31:28.227392Z",
+            "LastSend": "2023-12-05T11:02:57.528676Z"
+        },
         "CreateIndex": 89,
-        "ModifyIndex": 89
+        "ModifyIndex": 89,
+        "Remote": {
+            "Partition": "",
+            "Datacenter": "east"
+        }
     },
     {
         "ID": "1460ada9-26d2-f30d-3359-2968aa7dc47d",
@@ -312,8 +332,22 @@ $ curl --header "X-Consul-Token: 0137db51-5895-4c25-b6cd-d9ed992f4a52" \
         "Meta": {
             "env": "production"
         },
+        "StreamStatus": {
+            "ImportedServices": null,
+            "ExportedServices": [
+                  "backend",
+                  "frontend",
+            ],
+            "LastHeartbeat": "2023-12-13T06:31:28.227392Z",
+            "LastReceive": "2023-12-13T06:31:28.227392Z",
+            "LastSend": "2023-12-05T11:02:57.528676Z"
+        },
         "CreateIndex": 109,
-        "ModifyIndex": 119
-    },
+        "ModifyIndex": 119,
+        "Remote": {
+            "Partition": "",
+            "Datacenter": "east"
+        }
+    }
 ]
 ```

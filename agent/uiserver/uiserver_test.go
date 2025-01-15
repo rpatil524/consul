@@ -1,9 +1,11 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package uiserver
 
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,9 +13,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/html"
+
+	"github.com/hashicorp/go-hclog"
 
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/sdk/testutil"
@@ -380,7 +383,7 @@ func TestCustomDir(t *testing.T) {
 	defer os.RemoveAll(uiDir)
 
 	path := filepath.Join(uiDir, "test-file")
-	require.NoError(t, ioutil.WriteFile(path, []byte("test"), 0644))
+	require.NoError(t, os.WriteFile(path, []byte("test"), 0644))
 
 	cfg := basicUIEnabledConfig()
 	cfg.UIConfig.Dir = uiDir
@@ -427,7 +430,7 @@ func TestCompiledJS(t *testing.T) {
 
 			require.Equal(t, http.StatusOK, rec.Code)
 			require.Equal(t, rec.Result().Header["Content-Type"][0], "application/javascript")
-			wantCompiled, err := ioutil.ReadFile("testdata/compiled-metrics-providers-golden.js")
+			wantCompiled, err := os.ReadFile("testdata/compiled-metrics-providers-golden.js")
 			require.NoError(t, err)
 			require.Equal(t, rec.Body.String(), string(wantCompiled))
 		})

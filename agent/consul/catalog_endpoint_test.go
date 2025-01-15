@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package consul
 
 import (
@@ -7,19 +10,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/go-uuid"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	msgpackrpc "github.com/hashicorp/consul-net-rpc/net-rpc-msgpackrpc"
 	"github.com/hashicorp/consul-net-rpc/net/rpc"
+	"github.com/hashicorp/go-uuid"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/acl/resolver"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/internal/gossip/librtt"
 	"github.com/hashicorp/consul/lib/stringslice"
 	"github.com/hashicorp/consul/sdk/testutil"
 	"github.com/hashicorp/consul/sdk/testutil/retry"
@@ -982,6 +984,63 @@ func TestCatalog_RPC_Filter(t *testing.T) {
 		require.Equal(t, "baz", out.Nodes[0].Node)
 	})
 
+	t.Run("ListServices", func(t *testing.T) {
+		args := structs.ServiceSpecificRequest{
+			Datacenter:   "dc1",
+			ServiceName:  "redis",
+			QueryOptions: structs.QueryOptions{Filter: "ServiceMeta.version == 1"},
+		}
+
+		out := new(structs.IndexedServices)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &args, &out))
+		require.Len(t, out.Services, 2)
+		require.Len(t, out.Services["redis"], 1)
+		require.Len(t, out.Services["web"], 2)
+
+		args.Filter = "ServiceMeta.version == 2"
+		out = new(structs.IndexedServices)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &args, &out))
+		require.Len(t, out.Services, 4)
+		require.Len(t, out.Services["redis"], 1)
+		require.Len(t, out.Services["web"], 2)
+		require.Len(t, out.Services["critical"], 1)
+		require.Len(t, out.Services["warning"], 1)
+	})
+
+	t.Run("NodeServices", func(t *testing.T) {
+		args := structs.NodeSpecificRequest{
+			Datacenter:   "dc1",
+			Node:         "baz",
+			QueryOptions: structs.QueryOptions{Filter: "Service == web"},
+		}
+
+		out := new(structs.IndexedNodeServices)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &args, &out))
+		require.Len(t, out.NodeServices.Services, 2)
+
+		args.Filter = "Service == web and Meta.version == 2"
+		out = new(structs.IndexedNodeServices)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &args, &out))
+		require.Len(t, out.NodeServices.Services, 1)
+	})
+
+	t.Run("NodeServiceList", func(t *testing.T) {
+		args := structs.NodeSpecificRequest{
+			Datacenter:   "dc1",
+			Node:         "baz",
+			QueryOptions: structs.QueryOptions{Filter: "Service == web"},
+		}
+
+		out := new(structs.IndexedNodeServiceList)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.NodeServiceList", &args, &out))
+		require.Len(t, out.NodeServices.Services, 2)
+
+		args.Filter = "Service == web and Meta.version == 2"
+		out = new(structs.IndexedNodeServiceList)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.NodeServiceList", &args, &out))
+		require.Len(t, out.NodeServices.Services, 1)
+	})
+
 	t.Run("ServiceNodes", func(t *testing.T) {
 		args := structs.ServiceSpecificRequest{
 			Datacenter:   "dc1",
@@ -1004,22 +1063,6 @@ func TestCatalog_RPC_Filter(t *testing.T) {
 		require.Equal(t, "foo", out.ServiceNodes[0].Node)
 	})
 
-	t.Run("NodeServices", func(t *testing.T) {
-		args := structs.NodeSpecificRequest{
-			Datacenter:   "dc1",
-			Node:         "baz",
-			QueryOptions: structs.QueryOptions{Filter: "Service == web"},
-		}
-
-		out := new(structs.IndexedNodeServices)
-		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &args, &out))
-		require.Len(t, out.NodeServices.Services, 2)
-
-		args.Filter = "Service == web and Meta.version == 2"
-		out = new(structs.IndexedNodeServices)
-		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &args, &out))
-		require.Len(t, out.NodeServices.Services, 1)
-	})
 }
 
 func TestCatalog_ListNodes_StaleRead(t *testing.T) {
@@ -1231,9 +1274,9 @@ func TestCatalog_ListNodes_DistanceSort(t *testing.T) {
 
 	// Set all but one of the nodes to known coordinates.
 	updates := structs.Coordinates{
-		{Node: "foo", Coord: lib.GenerateCoordinate(2 * time.Millisecond)},
-		{Node: "bar", Coord: lib.GenerateCoordinate(5 * time.Millisecond)},
-		{Node: "baz", Coord: lib.GenerateCoordinate(1 * time.Millisecond)},
+		{Node: "foo", Coord: librtt.GenerateCoordinate(2 * time.Millisecond)},
+		{Node: "bar", Coord: librtt.GenerateCoordinate(5 * time.Millisecond)},
+		{Node: "baz", Coord: librtt.GenerateCoordinate(1 * time.Millisecond)},
 	}
 	if err := s1.fsm.State().CoordinateBatchUpdate(5, updates); err != nil {
 		t.Fatalf("err: %v", err)
@@ -1330,6 +1373,7 @@ func TestCatalog_ListNodes_ACLFilter(t *testing.T) {
 		Datacenter: "dc1",
 	}
 
+	readToken := token("read")
 	t.Run("deny", func(t *testing.T) {
 		args.Token = token("deny")
 
@@ -1346,7 +1390,7 @@ func TestCatalog_ListNodes_ACLFilter(t *testing.T) {
 	})
 
 	t.Run("allow", func(t *testing.T) {
-		args.Token = token("read")
+		args.Token = readToken
 
 		var reply structs.IndexedNodes
 		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ListNodes", &args, &reply); err != nil {
@@ -1358,6 +1402,67 @@ func TestCatalog_ListNodes_ACLFilter(t *testing.T) {
 		if reply.QueryMeta.ResultsFilteredByACLs {
 			t.Fatal("ResultsFilteredByACLs should not true")
 		}
+	})
+
+	// Register additional node
+	regArgs := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		WriteRequest: structs.WriteRequest{
+			Token: "root",
+		},
+	}
+
+	var out struct{}
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", regArgs, &out))
+
+	bexprMatchingUserTokenPermissions := fmt.Sprintf("Node matches `%s.*`", s1.config.NodeName)
+	const bexpNotMatchingUserTokenPermissions = "Node matches `node-deny.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		var reply structs.IndexedNodes
+		args = structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  readToken,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedNodes{}
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ListNodes", &args, &reply))
+		require.Equal(t, 1, len(reply.Nodes))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		var reply structs.IndexedNodes
+		args = structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  readToken,
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedNodes{}
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ListNodes", &args, &reply))
+		require.Empty(t, reply.Nodes)
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		var reply structs.IndexedNodes
+		args = structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedNodes{}
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ListNodes", &args, &reply))
+		require.Empty(t, reply.Nodes)
+		require.False(t, reply.ResultsFilteredByACLs)
 	})
 }
 
@@ -1523,6 +1628,45 @@ func TestCatalog_ListServices_NodeMetaFilter(t *testing.T) {
 	}
 }
 
+func TestCatalog_ListServices_Filter(t *testing.T) {
+	t.Parallel()
+	_, s1 := testServer(t)
+	codec := rpcClient(t, s1)
+
+	testrpc.WaitForTestAgent(t, s1.RPC, "dc1")
+
+	// prep the cluster with some data we can use in our filters
+	registerTestCatalogEntries(t, codec)
+
+	// Run the tests against the test server
+
+	t.Run("ListServices", func(t *testing.T) {
+		args := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+		}
+
+		args.Filter = "ServiceName == redis"
+		out := new(structs.IndexedServices)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &args, out))
+		require.Contains(t, out.Services, "redis")
+		require.ElementsMatch(t, []string{"v1", "v2"}, out.Services["redis"])
+
+		args.Filter = "NodeMeta.os == NoSuchOS"
+		out = new(structs.IndexedServices)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &args, out))
+		require.Len(t, out.Services, 0)
+
+		args.Filter = "NodeMeta.NoSuchMetadata == linux"
+		out = new(structs.IndexedServices)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &args, out))
+		require.Len(t, out.Services, 0)
+
+		args.Filter = "InvalidField == linux"
+		out = new(structs.IndexedServices)
+		require.Error(t, msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &args, out))
+	})
+}
+
 func TestCatalog_ListServices_Blocking(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
@@ -1651,7 +1795,6 @@ func TestCatalog_ListServices_Stale(t *testing.T) {
 		c.PrimaryDatacenter = "dc1" // Enable ACLs!
 		c.ACLsEnabled = true
 		c.Bootstrap = false // Disable bootstrap
-		c.RPCHoldTimeout = 10 * time.Millisecond
 	})
 	defer os.RemoveAll(dir2)
 	defer s2.Shutdown()
@@ -2097,9 +2240,9 @@ func TestCatalog_ListServiceNodes_DistanceSort(t *testing.T) {
 
 	// Set all but one of the nodes to known coordinates.
 	updates := structs.Coordinates{
-		{Node: "foo", Coord: lib.GenerateCoordinate(2 * time.Millisecond)},
-		{Node: "bar", Coord: lib.GenerateCoordinate(5 * time.Millisecond)},
-		{Node: "baz", Coord: lib.GenerateCoordinate(1 * time.Millisecond)},
+		{Node: "foo", Coord: librtt.GenerateCoordinate(2 * time.Millisecond)},
+		{Node: "bar", Coord: librtt.GenerateCoordinate(5 * time.Millisecond)},
+		{Node: "baz", Coord: librtt.GenerateCoordinate(1 * time.Millisecond)},
 	}
 	if err := s1.fsm.State().CoordinateBatchUpdate(9, updates); err != nil {
 		t.Fatalf("err: %v", err)
@@ -2718,6 +2861,14 @@ service "foo" {
 node_prefix "" {
 	policy = "read"
 }
+
+node "node-deny" {
+	policy = "deny"
+}
+
+service "service-deny" {
+	policy = "deny"
+}
 `
 	token = createToken(t, codec, rules)
 
@@ -2765,6 +2916,104 @@ node_prefix "" {
 	return
 }
 
+// TestCatalog_Register_DenyPeeringRegistration makes sure that users cannot send structs.RegisterRequest
+// with a PeerName in any part of the request.
+func TestCatalog_Register_DenyPeeringRegistration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+	_, s := testServerWithConfig(t)
+	codec := rpcClient(t, s)
+
+	// we will add PeerName to copies of arg
+	arg := structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			Service: "db",
+			Tags:    []string{"primary"},
+			Port:    8000,
+		},
+		Check: &structs.HealthCheck{
+			CheckID:   types.CheckID("db-check"),
+			ServiceID: "db",
+		},
+		Checks: structs.HealthChecks{
+			&structs.HealthCheck{
+				CheckID:   types.CheckID("db-check"),
+				ServiceID: "db",
+			},
+		},
+	}
+
+	type testcase struct {
+		name      string
+		reqCopyFn func(arg *structs.RegisterRequest) structs.RegisterRequest
+	}
+
+	testCases := []testcase{
+		{
+			name: "peer name on top level",
+			reqCopyFn: func(arg *structs.RegisterRequest) structs.RegisterRequest {
+				copyR := *arg
+				copyR.PeerName = "foo"
+				return copyR
+			},
+		},
+		{
+			name: "peer name in service",
+			reqCopyFn: func(arg *structs.RegisterRequest) structs.RegisterRequest {
+				copyR := *arg
+				copyR.Service.PeerName = "foo"
+				return copyR
+			},
+		},
+		{
+			name: "peer name in check",
+			reqCopyFn: func(arg *structs.RegisterRequest) structs.RegisterRequest {
+				copyR := *arg
+				copyR.Check.PeerName = "foo"
+				return copyR
+			},
+		},
+		{
+			name: "peer name in checks",
+			reqCopyFn: func(arg *structs.RegisterRequest) structs.RegisterRequest {
+				copyR := *arg
+				copyR.Checks[0].PeerName = "foo"
+				return copyR
+			},
+		},
+		{
+			name: "peer name everywhere",
+			reqCopyFn: func(arg *structs.RegisterRequest) structs.RegisterRequest {
+				copyR := *arg
+
+				copyR.PeerName = "foo1"
+				copyR.Service.PeerName = "foo2"
+				copyR.Check.PeerName = "foo3"
+				copyR.Checks[0].PeerName = "foo4"
+				return copyR
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := tc.reqCopyFn(&arg)
+
+			var out struct{}
+			err := msgpackrpc.CallWithCodec(codec, "Catalog.Register", &req, &out)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "cannot register requests with PeerName in them")
+		})
+	}
+
+}
+
 func TestCatalog_ListServices_FilterACL(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
@@ -2777,23 +3026,76 @@ func TestCatalog_ListServices_FilterACL(t *testing.T) {
 	defer codec.Close()
 	testrpc.WaitForTestAgent(t, srv.RPC, "dc1", testrpc.WithToken("root"))
 
-	opt := structs.DCSpecificRequest{
-		Datacenter:   "dc1",
-		QueryOptions: structs.QueryOptions{Token: token},
-	}
-	reply := structs.IndexedServices{}
-	if err := msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &opt, &reply); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if _, ok := reply.Services["foo"]; !ok {
-		t.Fatalf("bad: %#v", reply.Services)
-	}
-	if _, ok := reply.Services["bar"]; ok {
-		t.Fatalf("bad: %#v", reply.Services)
-	}
-	if !reply.QueryMeta.ResultsFilteredByACLs {
-		t.Fatal("ResultsFilteredByACLs should be true")
-	}
+	t.Run("request with user token without filter param sets ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.DCSpecificRequest{
+			Datacenter:   "dc1",
+			QueryOptions: structs.QueryOptions{Token: token},
+		}
+		reply := structs.IndexedServices{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		if _, ok := reply.Services["foo"]; !ok {
+			t.Fatalf("bad: %#v", reply.Services)
+		}
+		if _, ok := reply.Services["bar"]; ok {
+			t.Fatalf("bad: %#v", reply.Services)
+		}
+		if !reply.QueryMeta.ResultsFilteredByACLs {
+			t.Fatal("ResultsFilteredByACLs should be true")
+		}
+	})
+
+	const bexprMatchingUserTokenPermissions = "ServiceName matches `f.*`"
+	const bexpNotMatchingUserTokenPermissions = "ServiceName matches `b.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedServices{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Equal(t, 1, len(reply.Services))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedServices{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.Services))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		req := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedServices{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ListServices", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.Services))
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestCatalog_ServiceNodes_FilterACL(t *testing.T) {
@@ -2844,11 +3146,80 @@ func TestCatalog_ServiceNodes_FilterACL(t *testing.T) {
 	}
 	require.True(t, reply.QueryMeta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be true")
 
-	// We've already proven that we call the ACL filtering function so we
-	// test node filtering down in acl.go for node cases. This also proves
-	// that we respect the version 8 ACL flag, since the test server sets
-	// that to false (the regression value of *not* changing this is better
-	// for now until we change the sense of the version 8 ACL flag).
+	bexprMatchingUserTokenPermissions := fmt.Sprintf("Node matches `%s.*`", srv.config.NodeName)
+	const bexpNotMatchingUserTokenPermissions = "Node matches `node-deny.*`"
+
+	// Register a service of the same name on the denied node
+	regArg := structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "node-deny",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			ID:      "foo",
+			Service: "foo",
+		},
+		Check: &structs.HealthCheck{
+			CheckID:   "service:foo",
+			Name:      "service:foo",
+			ServiceID: "foo",
+			Status:    api.HealthPassing,
+		},
+		WriteRequest: structs.WriteRequest{Token: "root"},
+	}
+	if err := msgpackrpc.CallWithCodec(codec, "Catalog.Register", &regArg, nil); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		opt = structs.ServiceSpecificRequest{
+			Datacenter:  "dc1",
+			ServiceName: "foo",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedServiceNodes{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ServiceNodes", &opt, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Equal(t, 1, len(reply.ServiceNodes))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		opt = structs.ServiceSpecificRequest{
+			Datacenter:  "dc1",
+			ServiceName: "foo",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedServiceNodes{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ServiceNodes", &opt, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.ServiceNodes))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		opt = structs.ServiceSpecificRequest{
+			Datacenter:  "dc1",
+			ServiceName: "foo",
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedServiceNodes{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ServiceNodes", &opt, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.ServiceNodes))
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestCatalog_NodeServices_ACL(t *testing.T) {
@@ -2937,6 +3308,139 @@ func TestCatalog_NodeServices_FilterACL(t *testing.T) {
 	svc, ok := reply.NodeServices.Services["foo"]
 	require.True(t, ok)
 	require.Equal(t, "foo", svc.ID)
+
+	const bexprMatchingUserTokenPermissions = "Service matches `f.*`"
+	const bexpNotMatchingUserTokenPermissions = "Service matches `b.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.NodeSpecificRequest{
+			Datacenter: "dc1",
+			Node:       srv.config.NodeName,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedNodeServices{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Equal(t, 1, len(reply.NodeServices.Services))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.NodeSpecificRequest{
+			Datacenter: "dc1",
+			Node:       srv.config.NodeName,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedNodeServices{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.NodeServices.Services))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		req := structs.NodeSpecificRequest{
+			Datacenter: "dc1",
+			Node:       srv.config.NodeName,
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedNodeServices{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Nil(t, reply.NodeServices)
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
+}
+
+func TestCatalog_NodeServicesList_FilterACL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+	dir, token, srv, codec := testACLFilterServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer codec.Close()
+	testrpc.WaitForTestAgent(t, srv.RPC, "dc1", testrpc.WithToken("root"))
+
+	opt := structs.NodeSpecificRequest{
+		Datacenter:   "dc1",
+		Node:         srv.config.NodeName,
+		QueryOptions: structs.QueryOptions{Token: token},
+	}
+
+	var reply structs.IndexedNodeServiceList
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.NodeServiceList", &opt, &reply))
+
+	require.NotNil(t, reply.NodeServices)
+	require.Len(t, reply.NodeServices.Services, 1)
+
+	const bexprMatchingUserTokenPermissions = "Service matches `f.*`"
+	const bexpNotMatchingUserTokenPermissions = "Service matches `b.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.NodeSpecificRequest{
+			Datacenter: "dc1",
+			Node:       srv.config.NodeName,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedNodeServiceList{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.NodeServiceList", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Equal(t, 1, len(reply.NodeServices.Services))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.NodeSpecificRequest{
+			Datacenter: "dc1",
+			Node:       srv.config.NodeName,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedNodeServiceList{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.NodeServiceList", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.NodeServices.Services))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		req := structs.NodeSpecificRequest{
+			Datacenter: "dc1",
+			Node:       srv.config.NodeName,
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply = structs.IndexedNodeServiceList{}
+		if err := msgpackrpc.CallWithCodec(codec, "Catalog.NodeServiceList", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Empty(t, reply.NodeServices.Services)
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestCatalog_GatewayServices_TerminatingGateway(t *testing.T) {
@@ -3048,33 +3552,36 @@ func TestCatalog_GatewayServices_TerminatingGateway(t *testing.T) {
 
 		expect := structs.GatewayServices{
 			{
-				Service:     structs.NewServiceName("api", nil),
-				Gateway:     structs.NewServiceName("gateway", nil),
-				GatewayKind: structs.ServiceKindTerminatingGateway,
-				CAFile:      "api/ca.crt",
-				CertFile:    "api/client.crt",
-				KeyFile:     "api/client.key",
-				SNI:         "my-domain",
-				ServiceKind: structs.GatewayServiceKindService,
+				Service:         structs.NewServiceName("api", nil),
+				Gateway:         structs.NewServiceName("gateway", nil),
+				GatewayKind:     structs.ServiceKindTerminatingGateway,
+				CAFile:          "api/ca.crt",
+				CertFile:        "api/client.crt",
+				KeyFile:         "api/client.key",
+				SNI:             "my-domain",
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 			{
-				Service:     structs.NewServiceName("db", nil),
-				Gateway:     structs.NewServiceName("gateway", nil),
-				GatewayKind: structs.ServiceKindTerminatingGateway,
-				CAFile:      "",
-				CertFile:    "",
-				KeyFile:     "",
-				ServiceKind: structs.GatewayServiceKindService,
+				Service:         structs.NewServiceName("db", nil),
+				Gateway:         structs.NewServiceName("gateway", nil),
+				GatewayKind:     structs.ServiceKindTerminatingGateway,
+				CAFile:          "",
+				CertFile:        "",
+				KeyFile:         "",
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 			{
-				Service:      structs.NewServiceName("redis", nil),
-				Gateway:      structs.NewServiceName("gateway", nil),
-				GatewayKind:  structs.ServiceKindTerminatingGateway,
-				CAFile:       "ca.crt",
-				CertFile:     "client.crt",
-				KeyFile:      "client.key",
-				SNI:          "my-alt-domain",
-				FromWildcard: true,
+				Service:         structs.NewServiceName("redis", nil),
+				Gateway:         structs.NewServiceName("gateway", nil),
+				GatewayKind:     structs.ServiceKindTerminatingGateway,
+				CAFile:          "ca.crt",
+				CertFile:        "client.crt",
+				KeyFile:         "client.key",
+				SNI:             "my-alt-domain",
+				FromWildcard:    true,
+				AutoHostRewrite: true,
 			},
 		}
 
@@ -3206,10 +3713,11 @@ func TestCatalog_GatewayServices_BothGateways(t *testing.T) {
 
 		expect := structs.GatewayServices{
 			{
-				Service:     structs.NewServiceName("api", nil),
-				Gateway:     structs.NewServiceName("gateway", nil),
-				GatewayKind: structs.ServiceKindTerminatingGateway,
-				ServiceKind: structs.GatewayServiceKindService,
+				Service:         structs.NewServiceName("api", nil),
+				Gateway:         structs.NewServiceName("gateway", nil),
+				GatewayKind:     structs.ServiceKindTerminatingGateway,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 		}
 
@@ -3429,16 +3937,18 @@ service "gateway" {
 
 		expect := structs.GatewayServices{
 			{
-				Service:     structs.NewServiceName("db", nil),
-				Gateway:     structs.NewServiceName("gateway", nil),
-				GatewayKind: structs.ServiceKindTerminatingGateway,
-				ServiceKind: structs.GatewayServiceKindService,
+				Service:         structs.NewServiceName("db", nil),
+				Gateway:         structs.NewServiceName("gateway", nil),
+				GatewayKind:     structs.ServiceKindTerminatingGateway,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 			{
-				Service:     structs.NewServiceName("db_replica", nil),
-				Gateway:     structs.NewServiceName("gateway", nil),
-				GatewayKind: structs.ServiceKindTerminatingGateway,
-				ServiceKind: structs.GatewayServiceKindUnknown,
+				Service:         structs.NewServiceName("db_replica", nil),
+				Gateway:         structs.NewServiceName("gateway", nil),
+				GatewayKind:     structs.ServiceKindTerminatingGateway,
+				ServiceKind:     structs.GatewayServiceKindUnknown,
+				AutoHostRewrite: true,
 			},
 		}
 
@@ -3452,7 +3962,7 @@ service "gateway" {
 
 func TestVetRegisterWithACL(t *testing.T) {
 	appendAuthz := func(t *testing.T, defaultAuthz acl.Authorizer, rules string) acl.Authorizer {
-		policy, err := acl.NewPolicyFromSource(rules, acl.SyntaxCurrent, nil, nil)
+		policy, err := acl.NewPolicyFromSource(rules, nil, nil)
 		require.NoError(t, err)
 
 		authz, err := acl.NewPolicyAuthorizerWithDefaults(defaultAuthz, []*acl.Policy{policy}, nil)
@@ -3740,10 +4250,10 @@ func TestVetDeregisterWithACL(t *testing.T) {
 
 	// Create a basic node policy.
 	policy, err := acl.NewPolicyFromSource(`
-node "node" {
-  policy = "write"
-}
-`, acl.SyntaxLegacy, nil, nil)
+    node_prefix "node" {
+      policy = "write"
+    }
+    `, nil, nil)
 	if err != nil {
 		t.Fatalf("err %v", err)
 	}
@@ -3756,7 +4266,7 @@ node "node" {
 	service "my-service" {
 	  policy = "write"
 	}
-	`, acl.SyntaxLegacy, nil, nil)
+	`, nil, nil)
 	if err != nil {
 		t.Fatalf("err %v", err)
 	}

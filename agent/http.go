@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
@@ -7,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/netip"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -15,23 +19,35 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
+
 	"github.com/NYTimes/gziphandler"
 	"github.com/armon/go-metrics"
 	"github.com/armon/go-metrics/prometheus"
-	"github.com/hashicorp/go-cleanhttp"
 	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/hashicorp/go-cleanhttp"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/consul"
+	"github.com/hashicorp/consul/agent/consul/rate"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/agent/uiserver"
 	"github.com/hashicorp/consul/api"
+	resourcehttp "github.com/hashicorp/consul/internal/resource/http"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/logging"
-	"github.com/hashicorp/consul/proto/pbcommon"
+	"github.com/hashicorp/consul/proto/private/pbcommon"
+)
+
+const (
+	contentTypeHeader = "Content-Type"
+	plainContentType  = "text/plain; charset=utf-8"
 )
 
 var HTTPSummaries = []prometheus.SummaryDefinition{
@@ -81,6 +97,10 @@ type HTTPHandlers struct {
 	configReloaders []ConfigReloader
 	h               http.Handler
 	metricsProxyCfg atomic.Value
+
+	// proxyTransport is used by UIMetricsProxy to keep
+	// a managed pool of connections.
+	proxyTransport http.RoundTripper
 }
 
 // endpoint is a Consul-specific HTTP handler that takes the usual arguments in
@@ -156,7 +176,7 @@ func (s *HTTPHandlers) ReloadConfig(newCfg *config.RuntimeConfig) error {
 //
 // The first call must not be concurrent with any other call. Subsequent calls
 // may be concurrent with HTTP requests since no state is modified.
-func (s *HTTPHandlers) handler(enableDebug bool) http.Handler {
+func (s *HTTPHandlers) handler() http.Handler {
 	// Memoize multiple calls.
 	if s.h != nil {
 		return s.h
@@ -176,7 +196,9 @@ func (s *HTTPHandlers) handler(enableDebug bool) http.Handler {
 		// Register the wrapper.
 		wrapper := func(resp http.ResponseWriter, req *http.Request) {
 			start := time.Now()
-			handler(resp, req)
+
+			// this method is implemented by different flavours of consul e.g. oss, ce. ent.
+			s.enterpriseRequest(resp, req, handler)
 
 			labels := []metrics.Label{{Name: "method", Value: req.Method}, {Name: "path", Value: path_label}}
 			metrics.MeasureSinceWithLabels([]string{"api", "http"}, start, labels)
@@ -199,19 +221,22 @@ func (s *HTTPHandlers) handler(enableDebug bool) http.Handler {
 	// handlePProf takes the given pattern and pprof handler
 	// and wraps it to add authorization and metrics
 	handlePProf := func(pattern string, handler http.HandlerFunc) {
-		wrapper := func(resp http.ResponseWriter, req *http.Request) {
-			var token string
-			s.parseToken(req, &token)
 
-			// If enableDebug is not set, and ACLs are disabled, write
-			// an unauthorized response
-			if !enableDebug && s.checkACLDisabled() {
-				resp.WriteHeader(http.StatusUnauthorized)
+		wrapper := func(resp http.ResponseWriter, req *http.Request) {
+
+			// If enableDebug register wrapped pprof handlers
+			if !s.agent.enableDebug.Load() && s.checkACLDisabled() {
+				resp.WriteHeader(http.StatusNotFound)
+				resp.Header().Set(contentTypeHeader, plainContentType)
 				return
 			}
 
+			var token string
+			s.parseToken(req, &token)
+
 			authz, err := s.agent.delegate.ResolveTokenAndDefaultMeta(token, nil, nil)
 			if err != nil {
+				resp.Header().Set(contentTypeHeader, plainContentType)
 				resp.WriteHeader(http.StatusForbidden)
 				return
 			}
@@ -221,6 +246,7 @@ func (s *HTTPHandlers) handler(enableDebug bool) http.Handler {
 			// TODO(partitions): should this be possible in a partition?
 			// TODO(acl-error-enhancements): We should return error details somehow here.
 			if authz.OperatorRead(nil) != acl.Allow {
+				resp.Header().Set(contentTypeHeader, plainContentType)
 				resp.WriteHeader(http.StatusForbidden)
 				return
 			}
@@ -241,12 +267,24 @@ func (s *HTTPHandlers) handler(enableDebug bool) http.Handler {
 		handleFuncMetrics(pattern, s.wrap(bound, methods))
 	}
 
-	// Register wrapped pprof handlers
 	handlePProf("/debug/pprof/", pprof.Index)
 	handlePProf("/debug/pprof/cmdline", pprof.Cmdline)
 	handlePProf("/debug/pprof/profile", pprof.Profile)
 	handlePProf("/debug/pprof/symbol", pprof.Symbol)
 	handlePProf("/debug/pprof/trace", pprof.Trace)
+
+	resourceAPIPrefix := "/api"
+	mux.Handle(resourceAPIPrefix+"/",
+		http.StripPrefix(resourceAPIPrefix,
+			resourcehttp.NewHandler(
+				resourceAPIPrefix,
+				s.agent.delegate.ResourceServiceClient(),
+				s.agent.baseDeps.Registry,
+				s.parseToken,
+				s.agent.logger.Named(logging.HTTP),
+			),
+		),
+	)
 
 	if s.IsUIEnabled() {
 		// Note that we _don't_ support reloading ui_config.{enabled, content_dir,
@@ -287,12 +325,50 @@ func (s *HTTPHandlers) handler(enableDebug bool) http.Handler {
 	if s.agent.config.DisableHTTPUnprintableCharFilter {
 		h = mux
 	}
-	h = s.enterpriseHandler(h)
+
+	h = withRemoteAddrHandler(h)
+	h = ensureContentTypeHeader(h, s.agent.logger)
+
 	s.h = &wrappedMux{
 		mux:     mux,
 		handler: h,
 	}
 	return s.h
+}
+
+// Injects remote addr into the request's context
+func withRemoteAddrHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		addrPort, err := netip.ParseAddrPort(req.RemoteAddr)
+		if err == nil {
+			remoteAddr := net.TCPAddrFromAddrPort(addrPort)
+			ctx := consul.ContextWithRemoteAddr(req.Context(), remoteAddr)
+			req = req.WithContext(ctx)
+		}
+		next.ServeHTTP(resp, req)
+	})
+}
+
+// ensureContentTypeHeader injects content-type explicitly if not already set into response to prevent XSS
+func ensureContentTypeHeader(next http.Handler, logger hclog.Logger) http.Handler {
+	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		next.ServeHTTP(resp, req)
+
+		contentType := api.GetContentType(req)
+
+		if req != nil {
+			logger.Debug("warning: request content-type is not supported", "request-path", req.URL)
+			req.Header.Set(contentTypeHeader, contentType)
+		}
+
+		if resp != nil {
+			respContentType := resp.Header().Get(contentTypeHeader)
+			if respContentType == "" || respContentType != contentType {
+				logger.Debug("warning: response content-type header not explicitly set.", "request-path", req.URL)
+				resp.Header().Set(contentTypeHeader, contentType)
+			}
+		}
+	})
 }
 
 // nodeName returns the node name of the agent
@@ -314,8 +390,8 @@ func (s *HTTPHandlers) nodeName() string {
 // this regular expression is applied, so the regular expression substitution
 // results in:
 //
-// /v1/acl/clone/foo?token=bar -> /v1/acl/clone/<hidden>?token=bar
-//                                ^---- $1 ----^^- $2 -^^-- $3 --^
+//	/v1/acl/clone/foo?token=bar -> /v1/acl/clone/<hidden>?token=bar
+//	                               ^---- $1 ----^^- $2 -^^-- $3 --^
 //
 // And then the loop that looks for parameters called "token" does the last
 // step to get to the final redacted form.
@@ -338,6 +414,8 @@ func (s *HTTPHandlers) wrap(handler endpoint, methods []string) http.HandlerFunc
 				"from", req.RemoteAddr,
 				"error", err,
 			)
+			//set response type to plain to prevent XSS
+			resp.Header().Set(contentTypeHeader, plainContentType)
 			resp.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -350,6 +428,9 @@ func (s *HTTPHandlers) wrap(handler endpoint, methods []string) http.HandlerFunc
 				}
 				logURL = strings.Replace(logURL, token, "<hidden>", -1)
 			}
+			httpLogger.Warn("This request used the token query parameter "+
+				"which is deprecated and will be removed in a future Consul version",
+				"logUrl", logURL)
 		}
 		logURL = aclEndpointRE.ReplaceAllString(logURL, "$1<hidden>$4")
 
@@ -361,6 +442,8 @@ func (s *HTTPHandlers) wrap(handler endpoint, methods []string) http.HandlerFunc
 				"from", req.RemoteAddr,
 				"error", errMsg,
 			)
+			//set response type to plain to prevent XSS
+			resp.Header().Set(contentTypeHeader, plainContentType)
 			resp.WriteHeader(http.StatusForbidden)
 			fmt.Fprint(resp, errMsg)
 			return
@@ -370,17 +453,53 @@ func (s *HTTPHandlers) wrap(handler endpoint, methods []string) http.HandlerFunc
 			if acl.IsErrPermissionDenied(err) || acl.IsErrNotFound(err) {
 				return true
 			}
+			if e, ok := status.FromError(err); ok && e.Code() == codes.PermissionDenied {
+				return true
+			}
 			return false
+		}
+
+		isTooManyRequests := func(err error) bool {
+			if err == nil {
+				return false
+			}
+
+			// Client-side RPC limits.
+			if structs.IsErrRPCRateExceeded(err) {
+				return true
+			}
+
+			// Connect CA rate limiter.
+			if err.Error() == consul.ErrRateLimited.Error() {
+				return true
+			}
+
+			// gRPC server rate limit interceptor.
+			if status.Code(err) == codes.ResourceExhausted {
+				return true
+			}
+
+			// net/rpc server rate limit interceptor.
+			return strings.Contains(err.Error(), rate.ErrRetryElsewhere.Error())
+		}
+
+		isServiceUnavailable := func(err error) bool {
+			if err == nil {
+				return false
+			}
+
+			// gRPC server rate limit interceptor.
+			if status.Code(err) == codes.Unavailable {
+				return true
+			}
+
+			// net/rpc server rate limit interceptor.
+			return strings.Contains(err.Error(), rate.ErrRetryLater.Error())
 		}
 
 		isMethodNotAllowed := func(err error) bool {
 			_, ok := err.(MethodNotAllowedError)
 			return ok
-		}
-
-		isTooManyRequests := func(err error) bool {
-			// Sadness net/rpc can't do nice typed errors so this is all we got
-			return err.Error() == consul.ErrRateLimited.Error()
 		}
 
 		addAllowHeader := func(methods []string) {
@@ -407,12 +526,19 @@ func (s *HTTPHandlers) wrap(handler endpoint, methods []string) http.HandlerFunc
 					"error", err)
 			}
 
+			// If the error came from gRPC, unpack it to get the real message.
+			msg := err.Error()
+			if s, ok := status.FromError(err); ok {
+				msg = s.Message()
+			}
+
 			switch {
 			case isForbidden(err):
 				resp.WriteHeader(http.StatusForbidden)
-				fmt.Fprint(resp, err.Error())
-			case structs.IsErrRPCRateExceeded(err):
+			case isTooManyRequests(err):
 				resp.WriteHeader(http.StatusTooManyRequests)
+			case isServiceUnavailable(err):
+				resp.WriteHeader(http.StatusServiceUnavailable)
 			case isMethodNotAllowed(err):
 				// RFC2616 states that for 405 Method Not Allowed the response
 				// MUST include an Allow header containing the list of valid
@@ -420,26 +546,21 @@ func (s *HTTPHandlers) wrap(handler endpoint, methods []string) http.HandlerFunc
 				// https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html
 				addAllowHeader(err.(MethodNotAllowedError).Allow)
 				resp.WriteHeader(http.StatusMethodNotAllowed) // 405
-				fmt.Fprint(resp, err.Error())
 			case isHTTPError(err):
 				err := err.(HTTPError)
 				code := http.StatusInternalServerError
 				if err.StatusCode != 0 {
 					code = err.StatusCode
 				}
-				reason := "An unexpected error occurred"
-				if err.Error() != "" {
-					reason = err.Error()
+				if msg == "" {
+					msg = "An unexpected error occurred"
 				}
 				resp.WriteHeader(code)
-				fmt.Fprint(resp, reason)
-			case isTooManyRequests(err):
-				resp.WriteHeader(http.StatusTooManyRequests)
-				fmt.Fprint(resp, err.Error())
 			default:
 				resp.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprint(resp, err.Error())
 			}
+
+			fmt.Fprint(resp, msg)
 		}
 
 		start := time.Now()
@@ -502,6 +623,8 @@ func (s *HTTPHandlers) wrap(handler endpoint, methods []string) http.HandlerFunc
 					resp.Header().Add("X-Consul-Reason", errPayload.Reason)
 				}
 			} else {
+				//set response type to plain to prevent XSS
+				resp.Header().Set(contentTypeHeader, plainContentType)
 				handleErr(err)
 				return
 			}
@@ -513,6 +636,8 @@ func (s *HTTPHandlers) wrap(handler endpoint, methods []string) http.HandlerFunc
 		if contentType == "application/json" {
 			buf, err = s.marshalJSON(req, obj)
 			if err != nil {
+				//set response type to plain to prevent XSS
+				resp.Header().Set(contentTypeHeader, plainContentType)
 				handleErr(err)
 				return
 			}
@@ -523,7 +648,7 @@ func (s *HTTPHandlers) wrap(handler endpoint, methods []string) http.HandlerFunc
 				}
 			}
 		}
-		resp.Header().Set("Content-Type", contentType)
+		resp.Header().Set(contentTypeHeader, contentType)
 		resp.WriteHeader(httpCode)
 		resp.Write(buf)
 	}
@@ -537,7 +662,9 @@ func (s *HTTPHandlers) marshalJSON(req *http.Request, obj interface{}) ([]byte, 
 		if err != nil {
 			return nil, err
 		}
-		buf = append(buf, "\n"...)
+		if ok {
+			buf = append(buf, "\n"...)
+		}
 		return buf, nil
 	}
 
@@ -593,7 +720,7 @@ func decodeBody(body io.Reader, out interface{}) error {
 	return lib.DecodeJSON(body, out)
 }
 
-// decodeBodyDeprecated is deprecated, please ues decodeBody above.
+// decodeBodyDeprecated is deprecated, please use decodeBody above.
 // decodeBodyDeprecated is used to decode a JSON request body
 func decodeBodyDeprecated(req *http.Request, out interface{}, cb func(interface{}) error) error {
 	// This generally only happens in tests since real HTTP requests set
@@ -921,9 +1048,12 @@ func parseConsistencyReadRequest(resp http.ResponseWriter, req *http.Request, b 
 	}
 }
 
-// parseDC is used to parse the ?dc query param
+// parseDC is used to parse the datacenter from the query params.
+// ?datacenter has precedence over ?dc.
 func (s *HTTPHandlers) parseDC(req *http.Request, dc *string) {
-	if other := req.URL.Query().Get("dc"); other != "" {
+	if other := req.URL.Query().Get("datacenter"); other != "" {
+		*dc = other
+	} else if other = req.URL.Query().Get("dc"); other != "" {
 		*dc = other
 	} else if *dc == "" {
 		*dc = s.agent.config.Datacenter
@@ -1042,6 +1172,15 @@ func (s *HTTPHandlers) parseSource(req *http.Request, source *structs.QuerySourc
 func (s *HTTPHandlers) parsePeerName(req *http.Request, args *structs.ServiceSpecificRequest) {
 	if peer := req.URL.Query().Get("peer"); peer != "" {
 		args.PeerName = peer
+	}
+}
+
+func (s *HTTPHandlers) parseSamenessGroup(req *http.Request, args *structs.ServiceSpecificRequest) {
+	if sg := req.URL.Query().Get("sg"); sg != "" {
+		args.SamenessGroup = sg
+	}
+	if sg := req.URL.Query().Get("sameness-group"); sg != "" {
+		args.SamenessGroup = sg
 	}
 }
 

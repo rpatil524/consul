@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package structs
 
 import (
@@ -7,19 +10,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes/duration"
-	"github.com/golang/protobuf/ptypes/timestamp"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/serf/coordinate"
 	"github.com/mitchellh/hashstructure"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -84,6 +87,10 @@ const (
 	PeeringTerminateByIDType                    = 37
 	PeeringTrustBundleWriteType                 = 38
 	PeeringTrustBundleDeleteType                = 39
+	PeeringSecretsWriteType                     = 40
+	RaftLogVerifierCheckpoint                   = 41 // Only used for log verifier, no-op on FSM.
+	ResourceOperationType                       = 42
+	UpdateVirtualIPRequestType                  = 43
 )
 
 const (
@@ -149,6 +156,10 @@ var requestTypeStrings = map[MessageType]string{
 	PeeringDeleteType:               "PeeringDelete",
 	PeeringTrustBundleWriteType:     "PeeringTrustBundle",
 	PeeringTrustBundleDeleteType:    "PeeringTrustBundleDelete",
+	PeeringSecretsWriteType:         "PeeringSecret",
+	RaftLogVerifierCheckpoint:       "RaftLogVerifierCheckpoint",
+	ResourceOperationType:           "Resource",
+	UpdateVirtualIPRequestType:      "UpdateManualVirtualIPRequestType",
 }
 
 const (
@@ -211,9 +222,15 @@ const (
 	// WildcardSpecifier is the string which should be used for specifying a wildcard
 	// The exact semantics of the wildcard is left up to the code where its used.
 	WildcardSpecifier = "*"
+
+	// MetaConsulVersion is the node metadata key used to store the node's consul version
+	MetaConsulVersion = "consul-version"
 )
 
 var allowedConsulMetaKeysForMeshGateway = map[string]struct{}{MetaWANFederationKey: {}}
+
+// CEDowngrade indicates if we are in downgrading from ent to ce
+var CEDowngrade = os.Getenv("CONSUL_ENTERPRISE_DOWNGRADE_TO_CE") == "true"
 
 var (
 	NodeMaintCheckID = NewCheckID(NodeMaint, nil)
@@ -243,29 +260,28 @@ type RPCInfo interface {
 	TokenSecret() string
 	SetTokenSecret(string)
 	HasTimedOut(since time.Time, rpcHoldTimeout, maxQueryTime, defaultQueryTime time.Duration) (bool, error)
-	Timeout(rpcHoldTimeout, maxQueryTime, defaultQueryTime time.Duration) time.Duration
 }
 
 // QueryOptions is used to specify various flags for read queries
 type QueryOptions struct {
 	// Token is the ACL token ID. If not provided, the 'anonymous'
 	// token is assumed for backwards compatibility.
-	Token string
+	Token string `mapstructure:"x-consul-token,omitempty"`
 
 	// If set, wait until query exceeds given index. Must be provided
 	// with MaxQueryTime.
-	MinQueryIndex uint64
+	MinQueryIndex uint64 `mapstructure:"min-query-index,omitempty"`
 
 	// Provided with MinQueryIndex to wait for change.
-	MaxQueryTime time.Duration
+	MaxQueryTime time.Duration `mapstructure:"max-query-time,omitempty"`
 
 	// If set, any follower can service the request. Results
 	// may be arbitrarily stale.
-	AllowStale bool
+	AllowStale bool `mapstructure:"allow-stale,omitempty"`
 
 	// If set, the leader must verify leadership prior to
 	// servicing the request. Prevents a stale read.
-	RequireConsistent bool
+	RequireConsistent bool `mapstructure:"require-consistent,omitempty"`
 
 	// If set, the local agent may respond with an arbitrarily stale locally
 	// cached response. The semantics differ from AllowStale since the agent may
@@ -274,12 +290,12 @@ type QueryOptions struct {
 	// provide additional bounds on the last contact time from the leader. It's
 	// expected that servers that are partitioned are noticed and replaced in a
 	// timely way by operators while the same may not be true for client agents.
-	UseCache bool
+	UseCache bool `mapstructure:"use-cache,omitempty"`
 
 	// If set and AllowStale is true, will try first a stale
 	// read, and then will perform a consistent read if stale
 	// read is older than value.
-	MaxStaleDuration time.Duration
+	MaxStaleDuration time.Duration `mapstructure:"max-stale-duration,omitempty"`
 
 	// MaxAge limits how old a cached value will be returned if UseCache is true.
 	// If there is a cached response that is older than the MaxAge, it is treated
@@ -288,30 +304,30 @@ type QueryOptions struct {
 	// StaleIfError to a longer duration to change this behavior. It is ignored
 	// if the endpoint supports background refresh caching. See
 	// https://www.consul.io/api/index.html#agent-caching for more details.
-	MaxAge time.Duration
+	MaxAge time.Duration `mapstructure:"max-age,omitempty"`
 
 	// MustRevalidate forces the agent to fetch a fresh version of a cached
 	// resource or at least validate that the cached version is still fresh. It is
 	// implied by either max-age=0 or must-revalidate Cache-Control headers. It
 	// only makes sense when UseCache is true. We store it since MaxAge = 0 is the
 	// default unset value.
-	MustRevalidate bool
+	MustRevalidate bool `mapstructure:"must-revalidate,omitempty"`
 
 	// StaleIfError specifies how stale the client will accept a cached response
 	// if the servers are unavailable to fetch a fresh one. Only makes sense when
 	// UseCache is true and MaxAge is set to a lower, non-zero value. It is
 	// ignored if the endpoint supports background refresh caching. See
 	// https://www.consul.io/api/index.html#agent-caching for more details.
-	StaleIfError time.Duration
+	StaleIfError time.Duration `mapstructure:"stale-if-error,omitempty"`
 
 	// Filter specifies the go-bexpr filter expression to be used for
 	// filtering the data prior to returning a response
-	Filter string
+	Filter string `mapstructure:"filter,omitempty"`
 
 	// AllowNotModifiedResponse indicates that if the MinIndex matches the
 	// QueryMeta.Index, the response can be left empty and QueryMeta.NotModified
 	// will be set to true to indicate the result of the query has not changed.
-	AllowNotModifiedResponse bool
+	AllowNotModifiedResponse bool `mapstructure:"allow-not-modified-response,omitempty"`
 }
 
 // IsRead is always true for QueryOption.
@@ -342,7 +358,8 @@ func (q *QueryOptions) SetTokenSecret(s string) {
 	q.Token = s
 }
 
-func (q QueryOptions) Timeout(rpcHoldTimeout, maxQueryTime, defaultQueryTime time.Duration) time.Duration {
+// BlockingTimeout implements pool.BlockableQuery
+func (q QueryOptions) BlockingTimeout(maxQueryTime, defaultQueryTime time.Duration) time.Duration {
 	// Match logic in Server.blockingQuery.
 	if q.MinQueryIndex > 0 {
 		if q.MaxQueryTime > maxQueryTime {
@@ -351,15 +368,17 @@ func (q QueryOptions) Timeout(rpcHoldTimeout, maxQueryTime, defaultQueryTime tim
 			q.MaxQueryTime = defaultQueryTime
 		}
 		// Timeout after maximum jitter has elapsed.
-		q.MaxQueryTime += lib.RandomStagger(q.MaxQueryTime / JitterFraction)
+		q.MaxQueryTime += q.MaxQueryTime / JitterFraction
 
-		return q.MaxQueryTime + rpcHoldTimeout
+		return q.MaxQueryTime
 	}
-	return rpcHoldTimeout
+	return 0
 }
 
 func (q QueryOptions) HasTimedOut(start time.Time, rpcHoldTimeout, maxQueryTime, defaultQueryTime time.Duration) (bool, error) {
-	return time.Since(start) > q.Timeout(rpcHoldTimeout, maxQueryTime, defaultQueryTime), nil
+	// In addition to BlockingTimeout, allow for an additional rpcHoldTimeout buffer
+	// in case we need to wait for a leader election.
+	return time.Since(start) > rpcHoldTimeout+q.BlockingTimeout(maxQueryTime, defaultQueryTime), nil
 }
 
 type WriteRequest struct {
@@ -385,12 +404,8 @@ func (w *WriteRequest) SetTokenSecret(s string) {
 	w.Token = s
 }
 
-func (w WriteRequest) HasTimedOut(start time.Time, rpcHoldTimeout, maxQueryTime, defaultQueryTime time.Duration) (bool, error) {
-	return time.Since(start) > w.Timeout(rpcHoldTimeout, maxQueryTime, defaultQueryTime), nil
-}
-
-func (w WriteRequest) Timeout(rpcHoldTimeout, maxQueryTime, defaultQueryTime time.Duration) time.Duration {
-	return rpcHoldTimeout
+func (w WriteRequest) HasTimedOut(start time.Time, rpcHoldTimeout, _, _ time.Duration) (bool, error) {
+	return time.Since(start) > rpcHoldTimeout, nil
 }
 
 type QueryBackend int
@@ -410,6 +425,17 @@ func (q QueryBackend) String() string {
 		return "streaming"
 	default:
 		return ""
+	}
+}
+
+func QueryBackendFromString(s string) QueryBackend {
+	switch s {
+	case "blocking-query":
+		return QueryBackendBlocking
+	case "streaming":
+		return QueryBackendStreaming
+	default:
+		return QueryBackendBlocking
 	}
 }
 
@@ -462,6 +488,7 @@ type RegisterRequest struct {
 	Service         *NodeService
 	Check           *HealthCheck
 	Checks          HealthChecks
+	Locality        *Locality
 
 	// SkipNodeUpdate can be used when a register request is intended for
 	// updating a service and/or checks, but doesn't want to overwrite any
@@ -506,7 +533,8 @@ func (r *RegisterRequest) ChangesNode(node *Node) bool {
 		r.Address != node.Address ||
 		r.Datacenter != node.Datacenter ||
 		!reflect.DeepEqual(r.TaggedAddresses, node.TaggedAddresses) ||
-		!reflect.DeepEqual(r.NodeMeta, node.Meta) {
+		!reflect.DeepEqual(r.NodeMeta, node.Meta) ||
+		!reflect.DeepEqual(r.Locality, node.Locality) {
 		return true
 	}
 
@@ -555,7 +583,11 @@ type QuerySource struct {
 	Segment       string
 	Node          string
 	NodePartition string `json:",omitempty"`
-	Ip            string
+	// DisableNode indicates that the Node and NodePartition fields should not be used
+	// for determining the flow of the RPC. This is needed for agentless + wanfed to
+	// utilize streaming RPCs.
+	DisableNode bool `json:",omitempty"`
+	Ip          string
 }
 
 func (s QuerySource) NodeEnterpriseMeta() *acl.EnterpriseMeta {
@@ -629,10 +661,17 @@ func (r *DCSpecificRequest) CacheMinIndex() uint64 {
 	return r.QueryOptions.MinQueryIndex
 }
 
+type OperatorUsageRequest struct {
+	DCSpecificRequest
+
+	Global bool
+}
+
 type ServiceDumpRequest struct {
 	Datacenter         string
 	ServiceKind        ServiceKind
 	UseServiceKind     bool
+	NodesOnly          bool
 	Source             QuerySource
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
 	PeerName           string
@@ -665,6 +704,7 @@ func (r *ServiceDumpRequest) CacheInfo() cache.RequestInfo {
 	v, err := hashstructure.Hash([]interface{}{
 		keyKind,
 		r.UseServiceKind,
+		r.NodesOnly,
 		r.Filter,
 		r.EnterpriseMeta,
 	}, nil)
@@ -713,16 +753,20 @@ type ServiceSpecificRequest struct {
 	// The name of the peer that the requested service was imported from.
 	PeerName string
 
+	// The name of the sameness group that should be the target of the query.
+	SamenessGroup string
+
 	NodeMetaFilters map[string]string
 	ServiceName     string
 	ServiceKind     ServiceKind
 	// DEPRECATED (singular-service-tag) - remove this when backwards RPC compat
 	// with 1.2.x is not required.
-	ServiceTag     string
-	ServiceTags    []string
-	ServiceAddress string
-	TagFilter      bool // Controls tag filtering
-	Source         QuerySource
+	ServiceTag       string
+	ServiceTags      []string
+	ServiceAddress   string
+	TagFilter        bool // Controls tag filtering
+	HealthFilterType HealthFilterType
+	Source           QuerySource
 
 	// Connect if true will only search for Connect-compatible services.
 	Connect bool
@@ -780,9 +824,11 @@ func (r *ServiceSpecificRequest) CacheInfo() cache.RequestInfo {
 		r.Filter,
 		r.EnterpriseMeta,
 		r.PeerName,
+		r.SamenessGroup,
 		r.Ingress,
 		r.ServiceKind,
 		r.MergeCentralConfig,
+		r.HealthFilterType,
 	}, nil)
 	if err == nil {
 		// If there is an error, we don't set the key. A blank key forces
@@ -869,6 +915,7 @@ type Node struct {
 	PeerName        string `json:",omitempty"`
 	TaggedAddresses map[string]string
 	Meta            map[string]string
+	Locality        *Locality `json:",omitempty" bexpr:"-"`
 
 	RaftIndex `bexpr:"-"`
 }
@@ -1039,6 +1086,7 @@ type ServiceNode struct {
 	ServiceEnableTagOverride bool
 	ServiceProxy             ConnectProxyConfig
 	ServiceConnect           ServiceConnect
+	ServiceLocality          *Locality `bexpr:"-"`
 
 	// If not empty, PeerName represents the peer that this ServiceNode was imported from.
 	PeerName string `json:",omitempty"`
@@ -1046,6 +1094,15 @@ type ServiceNode struct {
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash" bexpr:"-"`
 
 	RaftIndex `bexpr:"-"`
+}
+
+func (s *ServiceNode) FillAuthzContext(ctx *acl.AuthorizerContext) {
+	if ctx == nil {
+		return
+	}
+	ctx.Peer = s.PeerName
+
+	s.EnterpriseMeta.FillAuthzContext(ctx)
 }
 
 func (s *ServiceNode) PeerOrEmpty() string {
@@ -1088,6 +1145,7 @@ func (s *ServiceNode) PartialClone() *ServiceNode {
 		ServiceEnableTagOverride: s.ServiceEnableTagOverride,
 		ServiceProxy:             s.ServiceProxy,
 		ServiceConnect:           s.ServiceConnect,
+		ServiceLocality:          s.ServiceLocality,
 		RaftIndex: RaftIndex{
 			CreateIndex: s.CreateIndex,
 			ModifyIndex: s.ModifyIndex,
@@ -1115,6 +1173,7 @@ func (s *ServiceNode) ToNodeService() *NodeService {
 		Connect:           s.ServiceConnect,
 		PeerName:          s.PeerName,
 		EnterpriseMeta:    s.EnterpriseMeta,
+		Locality:          s.ServiceLocality,
 		RaftIndex: RaftIndex{
 			CreateIndex: s.CreateIndex,
 			ModifyIndex: s.ModifyIndex,
@@ -1138,7 +1197,7 @@ func (sn *ServiceNode) CompoundServiceID() ServiceID {
 	}
 }
 
-func (sn *ServiceNode) CompoundServiceName() ServiceName {
+func (sn *ServiceNode) CompoundServiceName() PeeredServiceName {
 	name := sn.ServiceName
 	if name == "" {
 		name = sn.ServiceID
@@ -1148,10 +1207,14 @@ func (sn *ServiceNode) CompoundServiceName() ServiceName {
 	entMeta := sn.EnterpriseMeta
 	entMeta.Normalize()
 
-	return ServiceName{
-		Name:           name,
-		EnterpriseMeta: entMeta,
+	return PeeredServiceName{
+		ServiceName: ServiceName{
+			Name:           name,
+			EnterpriseMeta: entMeta,
+		},
+		Peer: sn.PeerName,
 	}
+
 }
 
 // Weights represent the weight used by DNS for a given status
@@ -1178,7 +1241,8 @@ func (k ServiceKind) IsProxy() bool {
 	case ServiceKindConnectProxy,
 		ServiceKindMeshGateway,
 		ServiceKindTerminatingGateway,
-		ServiceKindIngressGateway:
+		ServiceKindIngressGateway,
+		ServiceKindAPIGateway:
 		return true
 	}
 	return false
@@ -1191,29 +1255,40 @@ const (
 	// default to the typical service.
 	ServiceKindTypical ServiceKind = ""
 
-	// ServiceKindConnectProxy is a proxy for the Connect feature. This
+	// ServiceKindConnectProxy is a proxy for the Consul Service Mesh. This
 	// service proxies another service within Consul and speaks the connect
 	// protocol.
 	ServiceKindConnectProxy ServiceKind = "connect-proxy"
 
-	// ServiceKindMeshGateway is a Mesh Gateway for the Connect feature. This
-	// service will proxy connections based off the SNI header set by other
+	// ServiceKindMeshGateway is a Mesh Gateway for the Consul Service Mesh.
+	// This service will proxy connections based off the SNI header set by other
 	// connect proxies
 	ServiceKindMeshGateway ServiceKind = "mesh-gateway"
 
-	// ServiceKindTerminatingGateway is a Terminating Gateway for the Connect
-	// feature. This service will proxy connections to services outside the mesh.
+	// ServiceKindTerminatingGateway is a Terminating Gateway for the Consul Service
+	// Mesh feature. This service will proxy connections to services outside the mesh.
 	ServiceKindTerminatingGateway ServiceKind = "terminating-gateway"
 
-	// ServiceKindIngressGateway is an Ingress Gateway for the Connect feature.
+	// ServiceKindIngressGateway is an Ingress Gateway for the Consul Service Mesh.
 	// This service allows external traffic to enter the mesh based on
 	// centralized configuration.
 	ServiceKindIngressGateway ServiceKind = "ingress-gateway"
 
-	// ServiceKindDestination is a Destination  for the Connect feature.
+	// ServiceKindAPIGateway is an API Gateway for the Consul Service Mesh.
+	// This service allows external traffic to enter the mesh based on
+	// centralized configuration.
+	ServiceKindAPIGateway ServiceKind = "api-gateway"
+
+	// ServiceKindDestination is a Destination  for the Consul Service Mesh feature.
 	// This service allows external traffic to exit the mesh through a terminating gateway
 	// based on centralized configuration.
 	ServiceKindDestination ServiceKind = "destination"
+
+	// ServiceKindConnectEnabled is used to indicate whether a service is either
+	// connect-native or if the service has a corresponding sidecar. It is used for
+	// internal query purposes and should not be exposed to users as a valid Kind
+	// option.
+	ServiceKindConnectEnabled ServiceKind = "connect-enabled"
 )
 
 // Type to hold a address and port of a service
@@ -1225,6 +1300,8 @@ type ServiceAddress struct {
 func (a ServiceAddress) ToAPIServiceAddress() api.ServiceAddress {
 	return api.ServiceAddress{Address: a.Address, Port: a.Port}
 }
+
+const SidecarProxySuffix = "-sidecar-proxy"
 
 // NodeService is a service provided by a node
 type NodeService struct {
@@ -1243,6 +1320,7 @@ type NodeService struct {
 	SocketPath        string `json:",omitempty"` // TODO This might be integrated into Address somehow, but not sure about the ergonomics. Only one of (address,port) or socketpath can be defined.
 	Weights           *Weights
 	EnableTagOverride bool
+	Locality          *Locality `json:",omitempty" bexpr:"-"`
 
 	// Proxy is the configuration set for Kind = connect-proxy. It is mandatory in
 	// that case and an error to be set for any other kind. This config is part of
@@ -1255,8 +1333,9 @@ type NodeService struct {
 	// a pointer so that we never have to nil-check this.
 	Connect ServiceConnect
 
+	// TODO: rename to reflect that this is used to express future intent to register.
 	// LocallyRegisteredAsSidecar is private as it is only used by a local agent
-	// state to track if the service was registered from a nested sidecar_service
+	// state to track if the service was or will be registered from a nested sidecar_service
 	// block. We need to track that so we can know whether we need to deregister
 	// it automatically too if it's removed from the service definition or if the
 	// parent service is deregistered. Relying only on ID would cause us to
@@ -1294,6 +1373,15 @@ func (m *PeeringServiceMeta) PrimarySNI() string {
 		return ""
 	}
 	return m.SNI[0]
+}
+
+func (ns *NodeService) FillAuthzContext(ctx *acl.AuthorizerContext) {
+	if ctx == nil {
+		return
+	}
+	ctx.Peer = ns.PeerName
+
+	ns.EnterpriseMeta.FillAuthzContext(ctx)
 }
 
 func (ns *NodeService) BestAddress(wan bool) (string, int) {
@@ -1399,7 +1487,8 @@ func (s *NodeService) IsSidecarProxy() bool {
 func (s *NodeService) IsGateway() bool {
 	return s.Kind == ServiceKindMeshGateway ||
 		s.Kind == ServiceKindTerminatingGateway ||
-		s.Kind == ServiceKindIngressGateway
+		s.Kind == ServiceKindIngressGateway ||
+		s.Kind == ServiceKindAPIGateway
 }
 
 // Validate validates the node service configuration.
@@ -1409,6 +1498,31 @@ func (s *NodeService) IsGateway() bool {
 // ConnectProxy validation was moved here for easier table testing, but
 // other validation still exists in Catalog.Register.
 func (s *NodeService) Validate() error {
+	var result error
+
+	if err := s.Locality.Validate(); err != nil {
+		result = multierror.Append(result, err)
+	}
+
+	if s.Kind == ServiceKindConnectProxy {
+		if s.Port == 0 && s.SocketPath == "" {
+			result = multierror.Append(result, fmt.Errorf("Port or SocketPath must be set for a %s", s.Kind))
+		}
+	}
+
+	commonValidation := s.ValidateForAgent()
+	if commonValidation != nil {
+		result = multierror.Append(result, commonValidation)
+	}
+
+	return result
+}
+
+// ValidateForAgent does a subset validation, with the assumption that a local agent can assist with missing values.
+//
+// I.e. in the catalog case, a local agent cannot be assumed to facilitate auto-assignment of port or socket path,
+// so additional checks are needed.
+func (s *NodeService) ValidateForAgent() error {
 	var result error
 
 	// TODO(partitions): remember to double check that this doesn't cross partition boundaries
@@ -1426,13 +1540,13 @@ func (s *NodeService) Validate() error {
 					"services"))
 		}
 
-		if s.Port == 0 && s.SocketPath == "" {
-			result = multierror.Append(result, fmt.Errorf("Port or SocketPath must be set for a %s", s.Kind))
-		}
-
 		if s.Connect.Native {
 			result = multierror.Append(result, fmt.Errorf(
 				"A Proxy cannot also be Connect Native, only typical services"))
+		}
+
+		if err := validateOpaqueProxyConfig(s.Proxy.Config); err != nil {
+			result = multierror.Append(result, fmt.Errorf("Proxy.Config: %w", err))
 		}
 
 		// ensure we don't have multiple upstreams for the same service
@@ -1526,7 +1640,7 @@ func (s *NodeService) Validate() error {
 	// Gateway validation
 	if s.IsGateway() {
 		// Non-ingress gateways must have a port
-		if s.Port == 0 && s.Kind != ServiceKindIngressGateway {
+		if s.Port == 0 && s.Kind != ServiceKindIngressGateway && s.Kind != ServiceKindAPIGateway {
 			result = multierror.Append(result, fmt.Errorf("Port must be non-zero for a %s", s.Kind))
 		}
 
@@ -1597,6 +1711,7 @@ func (s *NodeService) IsSame(other *NodeService) bool {
 		!reflect.DeepEqual(s.TaggedAddresses, other.TaggedAddresses) ||
 		!reflect.DeepEqual(s.Weights, other.Weights) ||
 		!reflect.DeepEqual(s.Meta, other.Meta) ||
+		!reflect.DeepEqual(s.Locality, other.Locality) ||
 		s.EnableTagOverride != other.EnableTagOverride ||
 		s.Kind != other.Kind ||
 		!reflect.DeepEqual(s.Proxy, other.Proxy) ||
@@ -1672,6 +1787,7 @@ func (s *NodeService) ToServiceNode(node string) *ServiceNode {
 		ServiceEnableTagOverride: s.EnableTagOverride,
 		ServiceProxy:             s.Proxy,
 		ServiceConnect:           s.Connect,
+		ServiceLocality:          s.Locality,
 		EnterpriseMeta:           s.EnterpriseMeta,
 		PeerName:                 s.PeerName,
 		RaftIndex: RaftIndex{
@@ -1726,6 +1842,15 @@ type HealthCheck struct {
 	RaftIndex `bexpr:"-"`
 }
 
+func (hc *HealthCheck) FillAuthzContext(ctx *acl.AuthorizerContext) {
+	if ctx == nil {
+		return
+	}
+	ctx.Peer = hc.PeerName
+
+	hc.EnterpriseMeta.FillAuthzContext(ctx)
+}
+
 func (hc *HealthCheck) PeerOrEmpty() string {
 	return hc.PeerName
 }
@@ -1771,8 +1896,10 @@ type HealthCheckDefinition struct {
 	Body                           string              `json:",omitempty"`
 	DisableRedirects               bool                `json:",omitempty"`
 	TCP                            string              `json:",omitempty"`
+	TCPUseTLS                      bool                `json:",omitempty"`
 	UDP                            string              `json:",omitempty"`
 	H2PING                         string              `json:",omitempty"`
+	OSService                      string              `json:",omitempty"`
 	H2PingUseTLS                   bool                `json:",omitempty"`
 	Interval                       time.Duration       `json:",omitempty"`
 	OutputMaxSize                  uint                `json:",omitempty"`
@@ -1922,8 +2049,10 @@ func (c *HealthCheck) CheckType() *CheckType {
 		Body:                           c.Definition.Body,
 		DisableRedirects:               c.Definition.DisableRedirects,
 		TCP:                            c.Definition.TCP,
+		TCPUseTLS:                      c.Definition.TCPUseTLS,
 		UDP:                            c.Definition.UDP,
 		H2PING:                         c.Definition.H2PING,
+		OSService:                      c.Definition.OSService,
 		H2PingUseTLS:                   c.Definition.H2PingUseTLS,
 		Interval:                       c.Definition.Interval,
 		DockerContainerID:              c.Definition.DockerContainerID,
@@ -1975,20 +2104,53 @@ func (csn *CheckServiceNode) CanRead(authz acl.Authorizer) acl.EnforcementDecisi
 		return acl.Deny
 	}
 
-	authzContext := new(acl.AuthorizerContext)
-	csn.Service.EnterpriseMeta.FillAuthzContext(authzContext)
+	var authzContext acl.AuthorizerContext
+	csn.Service.FillAuthzContext(&authzContext)
 
-	if authz.NodeRead(csn.Node.Node, authzContext) != acl.Allow {
+	if authz.NodeRead(csn.Node.Node, &authzContext) != acl.Allow {
 		return acl.Deny
 	}
 
-	if authz.ServiceRead(csn.Service.Service, authzContext) != acl.Allow {
+	if authz.ServiceRead(csn.Service.Service, &authzContext) != acl.Allow {
 		return acl.Deny
 	}
 	return acl.Allow
 }
 
+func (csn *CheckServiceNode) Locality() *Locality {
+	if csn.Service != nil && csn.Service.Locality != nil {
+		return csn.Service.Locality
+	}
+
+	if csn.Node != nil && csn.Node.Locality != nil {
+		return csn.Node.Locality
+	}
+
+	return nil
+}
+
+func (csn *CheckServiceNode) ExcludeBasedOnChecks(opts CheckServiceNodeFilterOptions) bool {
+	for _, check := range csn.Checks {
+		if slices.Contains(opts.IgnoreCheckIDs, check.CheckID) {
+			// Skip this _check_ but keep looking at other checks for this node.
+			continue
+		}
+		if opts.FilterType.ExcludeBasedOnStatus(check.Status) {
+			return true
+		}
+	}
+	return false
+}
+
 type CheckServiceNodes []CheckServiceNode
+
+func (csns CheckServiceNodes) DeepCopy() CheckServiceNodes {
+	dup := make(CheckServiceNodes, len(csns))
+	for idx, v := range csns {
+		dup[idx] = *v.DeepCopy()
+	}
+	return dup
+}
 
 // Shuffle does an in-place random shuffle using the Fisher-Yates algorithm.
 func (nodes CheckServiceNodes) Shuffle() {
@@ -2019,39 +2181,42 @@ func (nodes CheckServiceNodes) ShallowClone() CheckServiceNodes {
 	return dup
 }
 
+// HealthFilterType is used to filter nodes based on their health status.
+type HealthFilterType int32
+
+func (h HealthFilterType) ExcludeBasedOnStatus(status string) bool {
+	switch {
+	case h == HealthFilterExcludeCritical && status == api.HealthCritical:
+		return true
+	case h == HealthFilterIncludeOnlyPassing && status != api.HealthPassing:
+		return true
+	}
+	return false
+}
+
+// These are listed from most to least inclusive.
+const (
+	HealthFilterIncludeAll         HealthFilterType = 0
+	HealthFilterExcludeCritical    HealthFilterType = 1
+	HealthFilterIncludeOnlyPassing HealthFilterType = 2
+)
+
+type CheckServiceNodeFilterOptions struct {
+	FilterType                  HealthFilterType
+	IgnoreCheckIDs              []types.CheckID
+	disableReceiverModification bool
+}
+
 // Filter removes nodes that are failing health checks (and any non-passing
 // check if that option is selected). Note that this returns the filtered
 // results AND modifies the receiver for performance.
-func (nodes CheckServiceNodes) Filter(onlyPassing bool) CheckServiceNodes {
-	return nodes.FilterIgnore(onlyPassing, nil)
-}
-
-// FilterIgnore removes nodes that are failing health checks just like Filter.
-// It also ignores the status of any check with an ID present in ignoreCheckIDs
-// as if that check didn't exist. Note that this returns the filtered results
-// AND modifies the receiver for performance.
-func (nodes CheckServiceNodes) FilterIgnore(onlyPassing bool,
-	ignoreCheckIDs []types.CheckID) CheckServiceNodes {
+func (nodes CheckServiceNodes) Filter(opts CheckServiceNodeFilterOptions) CheckServiceNodes {
 	n := len(nodes)
-OUTER:
 	for i := 0; i < n; i++ {
-		node := nodes[i]
-	INNER:
-		for _, check := range node.Checks {
-			for _, ignore := range ignoreCheckIDs {
-				if check.CheckID == ignore {
-					// Skip this _check_ but keep looking at other checks for this node.
-					continue INNER
-				}
-			}
-			if check.Status == api.HealthCritical ||
-				(onlyPassing && check.Status != api.HealthPassing) {
-				nodes[i], nodes[n-1] = nodes[n-1], CheckServiceNode{}
-				n--
-				i--
-				// Skip this _node_ now we've swapped it off the end of the list.
-				continue OUTER
-			}
+		if nodes[i].ExcludeBasedOnChecks(opts) {
+			nodes[i], nodes[n-1] = nodes[n-1], CheckServiceNode{}
+			n--
+			i--
 		}
 	}
 	return nodes[:n]
@@ -2185,15 +2350,40 @@ type IndexedServices struct {
 	QueryMeta
 }
 
+type Usage struct {
+	Usage map[string]ServiceUsage
+
+	QueryMeta
+}
+
+// ServiceUsage contains all of the usage data related to services
+type ServiceUsage struct {
+	Services                 int
+	ServiceInstances         int
+	ConnectServiceInstances  map[string]int
+	BillableServiceInstances int
+	Nodes                    int
+	EnterpriseServiceUsage
+}
+
 // PeeredServiceName is a basic tuple of ServiceName and peer
 type PeeredServiceName struct {
 	ServiceName ServiceName
 	Peer        string
 }
 
+func (psn PeeredServiceName) String() string {
+	return fmt.Sprintf("%v:%v", psn.ServiceName.String(), psn.Peer)
+}
+
+type ServiceNameWithSamenessGroup struct {
+	SamenessGroup string
+	ServiceName
+}
+
 type ServiceName struct {
-	Name string
-	acl.EnterpriseMeta
+	Name               string
+	acl.EnterpriseMeta `mapstructure:",squash"`
 }
 
 func NewServiceName(name string, entMeta *acl.EnterpriseMeta) ServiceName {
@@ -2799,11 +2989,12 @@ func EncodeProtoInterface(t MessageType, message interface{}) ([]byte, error) {
 }
 
 func EncodeProto(t MessageType, pb proto.Message) ([]byte, error) {
-	data := make([]byte, proto.Size(pb)+1)
-	data[0] = uint8(t)
+	data := make([]byte, 0, proto.Size(pb)+1)
+	data = append(data, uint8(t))
 
-	buf := proto.NewBuffer(data[1:1])
-	if err := buf.Marshal(pb); err != nil {
+	var err error
+	data, err = proto.MarshalOptions{}.MarshalAppend(data, pb)
+	if err != nil {
 		return nil, err
 	}
 
@@ -2902,24 +3093,88 @@ func (m MessageType) String() string {
 
 }
 
-func DurationToProto(d time.Duration) *duration.Duration {
+// This should only be used for conversions generated by MOG
+func DurationToProto(d time.Duration) *durationpb.Duration {
 	return durationpb.New(d)
 }
 
-func DurationFromProto(d *duration.Duration) time.Duration {
+// This should only be used for conversions generated by MOG
+func DurationFromProto(d *durationpb.Duration) time.Duration {
 	return d.AsDuration()
 }
 
-func TimeFromProto(s *timestamp.Timestamp) time.Time {
+// This should only be used for conversions generated by MOG
+func DurationPointerToProto(d *time.Duration) *durationpb.Duration {
+	if d == nil {
+		return nil
+	}
+	return durationpb.New(*d)
+}
+
+// This should only be used for conversions generated by MOG
+func DurationPointerFromProto(d *durationpb.Duration) *time.Duration {
+	if d == nil {
+		return nil
+	}
+	return DurationPointer(d.AsDuration())
+}
+
+func DurationPointer(d time.Duration) *time.Duration {
+	return &d
+}
+
+// This should only be used for conversions generated by MOG
+func TimeFromProto(s *timestamppb.Timestamp) time.Time {
 	return s.AsTime()
 }
 
-func TimeToProto(s time.Time) *timestamp.Timestamp {
+// This should only be used for conversions generated by MOG
+func TimeToProto(s time.Time) *timestamppb.Timestamp {
 	return timestamppb.New(s)
 }
 
 // IsZeroProtoTime returns true if the time is the minimum protobuf timestamp
 // (the Unix epoch).
-func IsZeroProtoTime(t *timestamp.Timestamp) bool {
+func IsZeroProtoTime(t *timestamppb.Timestamp) bool {
 	return t.Seconds == 0 && t.Nanos == 0
+}
+
+// Locality identifies where a given entity is running.
+type Locality struct {
+	// Region is region the zone belongs to.
+	Region string `json:",omitempty"`
+
+	// Zone is the zone the entity is running in.
+	Zone string `json:",omitempty"`
+}
+
+// ToAPI converts a struct Locality to an API Locality.
+func (l *Locality) ToAPI() *api.Locality {
+	if l == nil {
+		return nil
+	}
+
+	return &api.Locality{
+		Region: l.Region,
+		Zone:   l.Zone,
+	}
+}
+
+func (l *Locality) GetRegion() string {
+	if l == nil {
+		return ""
+	}
+	return l.Region
+}
+
+func (l *Locality) Validate() error {
+	if l == nil {
+		return nil
+	}
+
+	if l.Region == "" && l.Zone != "" {
+		return fmt.Errorf("zone cannot be set without region")
+	}
+
+	return nil
 }

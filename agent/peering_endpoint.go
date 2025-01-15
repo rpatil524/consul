@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
@@ -5,11 +8,15 @@ import (
 	"net/http"
 	"strings"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+
 	"github.com/hashicorp/consul/acl"
 	external "github.com/hashicorp/consul/agent/grpc-external"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
-	"github.com/hashicorp/consul/proto/pbpeering"
+	"github.com/hashicorp/consul/proto/private/pbpeering"
 )
 
 // PeeringEndpoint handles GET, DELETE on v1/peering/name
@@ -42,11 +49,17 @@ func (s *HTTPHandlers) peeringRead(resp http.ResponseWriter, req *http.Request, 
 		Partition: entMeta.PartitionOrEmpty(),
 	}
 
-	var token string
-	s.parseToken(req, &token)
-	ctx := external.ContextWithToken(req.Context(), token)
+	var dc string
+	options := structs.QueryOptions{}
+	s.parse(resp, req, &dc, &options)
+	options.AllowStale = false // To get all information on a peering, this request must be forward to a leader
+	ctx, err := external.ContextWithQueryOptions(req.Context(), options)
+	if err != nil {
+		return nil, err
+	}
 
-	result, err := s.agent.rpcClientPeering.PeeringRead(ctx, &args)
+	var header metadata.MD
+	result, err := s.agent.rpcClientPeering.PeeringRead(ctx, &args, grpc.Header(&header))
 	if err != nil {
 		return nil, err
 	}
@@ -54,10 +67,18 @@ func (s *HTTPHandlers) peeringRead(resp http.ResponseWriter, req *http.Request, 
 		return nil, HTTPError{StatusCode: http.StatusNotFound, Reason: fmt.Sprintf("Peering not found for %q", name)}
 	}
 
+	meta, err := external.QueryMetaFromGRPCMeta(header)
+	if err != nil {
+		return result.Peering.ToAPI(), fmt.Errorf("could not convert gRPC metadata to query meta: %w", err)
+	}
+	if err := setMeta(resp, &meta); err != nil {
+		return nil, err
+	}
+
 	return result.Peering.ToAPI(), nil
 }
 
-// PeeringList fetches all peerings in the datacenter in OSS or in a given partition in Consul Enterprise.
+// PeeringList fetches all peerings in the datacenter in CE or in a given partition in Consul Enterprise.
 func (s *HTTPHandlers) PeeringList(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	var entMeta acl.EnterpriseMeta
 	if err := s.parseEntMetaPartition(req, &entMeta); err != nil {
@@ -67,12 +88,26 @@ func (s *HTTPHandlers) PeeringList(resp http.ResponseWriter, req *http.Request) 
 		Partition: entMeta.PartitionOrEmpty(),
 	}
 
-	var token string
-	s.parseToken(req, &token)
-	ctx := external.ContextWithToken(req.Context(), token)
-
-	pbresp, err := s.agent.rpcClientPeering.PeeringList(ctx, &args)
+	var dc string
+	options := structs.QueryOptions{}
+	s.parse(resp, req, &dc, &options)
+	options.AllowStale = false // To get all information on a peering, this request must be forward to a leader
+	ctx, err := external.ContextWithQueryOptions(req.Context(), options)
 	if err != nil {
+		return nil, err
+	}
+
+	var header metadata.MD
+	pbresp, err := s.agent.rpcClientPeering.PeeringList(ctx, &args, grpc.Header(&header))
+	if err != nil {
+		return nil, err
+	}
+
+	meta, err := external.QueryMetaFromGRPCMeta(header)
+	if err != nil {
+		return pbresp.ToAPI(), fmt.Errorf("could not convert gRPC metadata to query meta: %w", err)
+	}
+	if err := setMeta(resp, &meta); err != nil {
 		return nil, err
 	}
 
@@ -106,7 +141,11 @@ func (s *HTTPHandlers) PeeringGenerateToken(resp http.ResponseWriter, req *http.
 
 	var token string
 	s.parseToken(req, &token)
-	ctx := external.ContextWithToken(req.Context(), token)
+	options := structs.QueryOptions{Token: token}
+	ctx, err := external.ContextWithQueryOptions(req.Context(), options)
+	if err != nil {
+		return nil, err
+	}
 
 	out, err := s.agent.rpcClientPeering.GenerateToken(ctx, args)
 	if err != nil {
@@ -146,7 +185,11 @@ func (s *HTTPHandlers) PeeringEstablish(resp http.ResponseWriter, req *http.Requ
 
 	var token string
 	s.parseToken(req, &token)
-	ctx := external.ContextWithToken(req.Context(), token)
+	options := structs.QueryOptions{Token: token}
+	ctx, err := external.ContextWithQueryOptions(req.Context(), options)
+	if err != nil {
+		return nil, err
+	}
 
 	out, err := s.agent.rpcClientPeering.Establish(ctx, args)
 	if err != nil {
@@ -170,9 +213,13 @@ func (s *HTTPHandlers) peeringDelete(resp http.ResponseWriter, req *http.Request
 
 	var token string
 	s.parseToken(req, &token)
-	ctx := external.ContextWithToken(req.Context(), token)
+	options := structs.QueryOptions{Token: token}
+	ctx, err := external.ContextWithQueryOptions(req.Context(), options)
+	if err != nil {
+		return nil, err
+	}
 
-	_, err := s.agent.rpcClientPeering.PeeringDelete(ctx, &args)
+	_, err = s.agent.rpcClientPeering.PeeringDelete(ctx, &args)
 	if err != nil {
 		return nil, err
 	}

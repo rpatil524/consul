@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Serializer from './application';
 import { inject as service } from '@ember/service';
 import { get } from '@ember/object';
@@ -35,11 +40,11 @@ export default class IntentionSerializer extends Serializer {
 
   respondForQuery(respond, query) {
     return super.respondForQuery(
-      cb =>
+      (cb) =>
         respond((headers, body) => {
           return cb(
             headers,
-            body.map(item => this.ensureID(item))
+            body.map((item) => this.ensureID(item))
           );
         }),
       query
@@ -48,7 +53,7 @@ export default class IntentionSerializer extends Serializer {
 
   respondForQueryRecord(respond, query) {
     return super.respondForQueryRecord(
-      cb =>
+      (cb) =>
         respond((headers, body) => {
           body = this.ensureID(body);
           return cb(headers, body);

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package proxycfg
 
 import (
@@ -63,22 +66,29 @@ func NewUpstreamIDFromServiceID(sid structs.ServiceID) UpstreamID {
 	return id
 }
 
-// TODO(peering): confirm we don't need peername here
 func NewUpstreamIDFromTargetID(tid string) UpstreamID {
-	// Drop the leading subset if one is present in the target ID.
-	separators := strings.Count(tid, ".")
-	if separators > 3 {
-		prefix := tid[:strings.Index(tid, ".")+1]
-		tid = strings.TrimPrefix(tid, prefix)
+	var id UpstreamID
+	split := strings.Split(tid, ".")
+
+	switch {
+	case split[len(split)-2] == "external":
+		id = UpstreamID{
+			Name:           split[0],
+			EnterpriseMeta: acl.NewEnterpriseMetaWithPartition(split[2], split[1]),
+			Peer:           split[4],
+		}
+	case len(split) == 5:
+		// Drop the leading subset if one is present in the target ID.
+		split = split[1:]
+		fallthrough
+	default:
+		id = UpstreamID{
+			Name:           split[0],
+			EnterpriseMeta: acl.NewEnterpriseMetaWithPartition(split[2], split[1]),
+			Datacenter:     split[3],
+		}
 	}
 
-	split := strings.SplitN(tid, ".", 4)
-
-	id := UpstreamID{
-		Name:           split[0],
-		EnterpriseMeta: acl.NewEnterpriseMetaWithPartition(split[2], split[1]),
-		Datacenter:     split[3],
-	}
 	id.normalize()
 	return id
 }
@@ -143,7 +153,7 @@ func ParseUpstreamIDString(input string) (typ, dc, name string, meta *acl.Enterp
 // This should be used for any situation where we generate identifiers in Envoy
 // xDS structures for this upstream.
 //
-// This will ensure that generated identifiers for the same thing in OSS and
+// This will ensure that generated identifiers for the same thing in CE and
 // Enterprise render the same and omit default namespaces and partitions.
 func (u UpstreamID) EnvoyID() string {
 	name := u.enterpriseIdentifierPrefix() + u.Name
@@ -172,4 +182,12 @@ func UpstreamsToMap(us structs.Upstreams) map[UpstreamID]*structs.Upstream {
 		upstreamMap[NewUpstreamID(&u)] = &u
 	}
 	return upstreamMap
+}
+
+func NewWildcardUID(entMeta *acl.EnterpriseMeta) UpstreamID {
+	wildcardSID := structs.NewServiceID(
+		structs.WildcardSpecifier,
+		entMeta.WithWildcardNamespace(),
+	)
+	return NewUpstreamIDFromServiceID(wildcardSID)
 }

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 // Package cache provides caching features for data from a Consul server.
 //
 // While this is similar in some ways to the "agent/ae" package, a key
@@ -29,6 +32,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/agent/cacheshim"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/lib/ttlcache"
 )
@@ -37,6 +41,10 @@ import (
 var Gauges = []prometheus.GaugeDefinition{
 	{
 		Name: []string{"consul", "cache", "entries_count"},
+		Help: "Deprecated - please use cache_entries_count instead.",
+	},
+	{
+		Name: []string{"cache", "entries_count"},
 		Help: "Represents the number of entries in this cache.",
 	},
 }
@@ -45,18 +53,34 @@ var Gauges = []prometheus.GaugeDefinition{
 var Counters = []prometheus.CounterDefinition{
 	{
 		Name: []string{"consul", "cache", "bypass"},
+		Help: "Deprecated - please use cache_bypass instead.",
+	},
+	{
+		Name: []string{"cache", "bypass"},
 		Help: "Counts how many times a request bypassed the cache because no cache-key was provided.",
 	},
 	{
 		Name: []string{"consul", "cache", "fetch_success"},
+		Help: "Deprecated - please use cache_fetch_success instead.",
+	},
+	{
+		Name: []string{"cache", "fetch_success"},
 		Help: "Counts the number of successful fetches by the cache.",
 	},
 	{
 		Name: []string{"consul", "cache", "fetch_error"},
+		Help: "Deprecated - please use cache_fetch_error instead.",
+	},
+	{
+		Name: []string{"cache", "fetch_error"},
 		Help: "Counts the number of failed fetches by the cache.",
 	},
 	{
 		Name: []string{"consul", "cache", "evict_expired"},
+		Help: "Deprecated - please use cache_evict_expired instead.",
+	},
+	{
+		Name: []string{"cache", "evict_expired"},
 		Help: "Counts the number of expired entries that are evicted.",
 	},
 }
@@ -119,6 +143,10 @@ type Cache struct {
 	entries           map[string]cacheEntry
 	entriesExpiryHeap *ttlcache.ExpiryHeap
 
+	fetchLock    sync.Mutex
+	lastFetchID  uint64
+	fetchHandles map[string]fetchHandle
+
 	// stopped is used as an atomic flag to signal that the Cache has been
 	// discarded so background fetches and expiry processing should stop.
 	stopped uint32
@@ -128,6 +156,11 @@ type Cache struct {
 	options          Options
 	rateLimitContext context.Context
 	rateLimitCancel  context.CancelFunc
+}
+
+type fetchHandle struct {
+	id     uint64
+	stopCh chan struct{}
 }
 
 // typeEntry is a single type that is registered with a Cache.
@@ -140,32 +173,7 @@ type typeEntry struct {
 
 // ResultMeta is returned from Get calls along with the value and can be used
 // to expose information about the cache status for debugging or testing.
-type ResultMeta struct {
-	// Hit indicates whether or not the request was a cache hit
-	Hit bool
-
-	// Age identifies how "stale" the result is. It's semantics differ based on
-	// whether or not the cache type performs background refresh or not as defined
-	// in https://www.consul.io/api/index.html#agent-caching.
-	//
-	// For background refresh types, Age is 0 unless the background blocking query
-	// is currently in a failed state and so not keeping up with the server's
-	// values. If it is non-zero it represents the time since the first failure to
-	// connect during background refresh, and is reset after a background request
-	// does manage to reconnect and either return successfully, or block for at
-	// least the yamux keepalive timeout of 30 seconds (which indicates the
-	// connection is OK but blocked as expected).
-	//
-	// For simple cache types, Age is the time since the result being returned was
-	// fetched from the servers.
-	Age time.Duration
-
-	// Index is the internal ModifyIndex for the cache entry. Not all types
-	// support blocking and all that do will likely have this in their result type
-	// already but this allows generic code to reason about whether cache values
-	// have changed.
-	Index uint64
-}
+type ResultMeta = cacheshim.ResultMeta
 
 // Options are options for the Cache.
 type Options struct {
@@ -205,6 +213,7 @@ func New(options Options) *Cache {
 		types:             make(map[string]typeEntry),
 		entries:           make(map[string]cacheEntry),
 		entriesExpiryHeap: ttlcache.NewExpiryHeap(),
+		fetchHandles:      make(map[string]fetchHandle),
 		stopCh:            make(chan struct{}),
 		options:           options,
 		rateLimitContext:  ctx,
@@ -397,6 +406,7 @@ func entryExceedsMaxAge(maxAge time.Duration, entry cacheEntry) bool {
 func (c *Cache) getWithIndex(ctx context.Context, r getOptions) (interface{}, ResultMeta, error) {
 	if r.Info.Key == "" {
 		metrics.IncrCounter([]string{"consul", "cache", "bypass"}, 1)
+		metrics.IncrCounter([]string{"cache", "bypass"}, 1)
 
 		// If no key is specified, then we do not cache this request.
 		// Pass directly through to the backend.
@@ -443,6 +453,7 @@ RETRY_GET:
 		meta := ResultMeta{Index: entry.Index}
 		if first {
 			metrics.IncrCounter([]string{"consul", "cache", r.TypeEntry.Name, "hit"}, 1)
+			metrics.IncrCounter([]string{"cache", r.TypeEntry.Name, "hit"}, 1)
 			meta.Hit = true
 		}
 
@@ -496,6 +507,7 @@ RETRY_GET:
 			missKey = "miss_new"
 		}
 		metrics.IncrCounter([]string{"consul", "cache", r.TypeEntry.Name, missKey}, 1)
+		metrics.IncrCounter([]string{"cache", r.TypeEntry.Name, missKey}, 1)
 	}
 
 	// Set our timeout channel if we must
@@ -588,10 +600,21 @@ func (c *Cache) fetch(key string, r getOptions, allowNew bool, attempt uint, ign
 	entry.Fetching = true
 	c.entries[key] = entry
 	metrics.SetGauge([]string{"consul", "cache", "entries_count"}, float32(len(c.entries)))
+	metrics.SetGauge([]string{"cache", "entries_count"}, float32(len(c.entries)))
 
 	tEntry := r.TypeEntry
-	// The actual Fetch must be performed in a goroutine.
-	go func() {
+
+	// The actual Fetch must be performed in a goroutine. Ensure that we only
+	// have one in-flight at a time, but don't use a deferred
+	// context.WithCancel style termination so that these things outlive their
+	// requester.
+	//
+	// By the time we get here the system WANTS to make a replacement fetcher, so
+	// we terminate the prior one and replace it.
+	handle := c.getOrReplaceFetchHandle(key)
+	go func(handle fetchHandle) {
+		defer c.deleteFetchHandle(key, handle.id)
+
 		// If we have background refresh and currently are in "disconnected" state,
 		// waiting for a response might mean we mark our results as stale for up to
 		// 10 minutes (max blocking timeout) after connection is restored. To reduce
@@ -640,6 +663,14 @@ func (c *Cache) fetch(key string, r getOptions, allowNew bool, attempt uint, ign
 		result, err := r.Fetch(fOpts)
 		if connectedTimer != nil {
 			connectedTimer.Stop()
+		}
+
+		// If we were stopped while waiting on a blocking query now would be a
+		// good time to detect that.
+		select {
+		case <-handle.stopCh:
+			return
+		default:
 		}
 
 		// Copy the existing entry to start.
@@ -694,7 +725,9 @@ func (c *Cache) fetch(key string, r getOptions, allowNew bool, attempt uint, ign
 			labels := []metrics.Label{{Name: "result_not_modified", Value: strconv.FormatBool(result.NotModified)}}
 			// TODO(kit): move tEntry.Name to a label on the first write here and deprecate the second write
 			metrics.IncrCounterWithLabels([]string{"consul", "cache", "fetch_success"}, 1, labels)
+			metrics.IncrCounterWithLabels([]string{"cache", "fetch_success"}, 1, labels)
 			metrics.IncrCounterWithLabels([]string{"consul", "cache", tEntry.Name, "fetch_success"}, 1, labels)
+			metrics.IncrCounterWithLabels([]string{"cache", tEntry.Name, "fetch_success"}, 1, labels)
 
 			if result.Index > 0 {
 				// Reset the attempts counter so we don't have any backoff
@@ -728,7 +761,9 @@ func (c *Cache) fetch(key string, r getOptions, allowNew bool, attempt uint, ign
 
 			// TODO(kit): Add tEntry.Name to label on fetch_error and deprecate second write
 			metrics.IncrCounterWithLabels([]string{"consul", "cache", "fetch_error"}, 1, labels)
+			metrics.IncrCounterWithLabels([]string{"cache", "fetch_error"}, 1, labels)
 			metrics.IncrCounterWithLabels([]string{"consul", "cache", tEntry.Name, "fetch_error"}, 1, labels)
+			metrics.IncrCounterWithLabels([]string{"cache", tEntry.Name, "fetch_error"}, 1, labels)
 
 			// Increment attempt counter
 			attempt++
@@ -792,13 +827,15 @@ func (c *Cache) fetch(key string, r getOptions, allowNew bool, attempt uint, ign
 			}
 
 			// If we're over the attempt minimum, start an exponential backoff.
-			if wait := backOffWait(attempt); wait > 0 {
-				time.Sleep(wait)
-			}
+			wait := backOffWait(attempt)
 
 			// If we have a timer, wait for it
-			if tEntry.Opts.RefreshTimer > 0 {
-				time.Sleep(tEntry.Opts.RefreshTimer)
+			wait += tEntry.Opts.RefreshTimer
+
+			select {
+			case <-time.After(wait):
+			case <-handle.stopCh:
+				return
 			}
 
 			// Trigger. The "allowNew" field is false because in the time we were
@@ -808,9 +845,44 @@ func (c *Cache) fetch(key string, r getOptions, allowNew bool, attempt uint, ign
 			r.Info.MinIndex = 0
 			c.fetch(key, r, false, attempt, true)
 		}
-	}()
+	}(handle)
 
 	return entry.Waiter
+}
+
+func (c *Cache) getOrReplaceFetchHandle(key string) fetchHandle {
+	c.fetchLock.Lock()
+	defer c.fetchLock.Unlock()
+
+	if prevHandle, ok := c.fetchHandles[key]; ok {
+		close(prevHandle.stopCh)
+	}
+
+	c.lastFetchID++
+
+	handle := fetchHandle{
+		id:     c.lastFetchID,
+		stopCh: make(chan struct{}),
+	}
+
+	c.fetchHandles[key] = handle
+
+	return handle
+}
+
+func (c *Cache) deleteFetchHandle(key string, fetchID uint64) {
+	c.fetchLock.Lock()
+	defer c.fetchLock.Unlock()
+
+	// Only remove a fetchHandle if it's YOUR fetchHandle.
+	handle, ok := c.fetchHandles[key]
+	if !ok {
+		return
+	}
+
+	if handle.id == fetchID {
+		delete(c.fetchHandles, key)
+	}
 }
 
 func backOffWait(failures uint) time.Duration {
@@ -858,7 +930,9 @@ func (c *Cache) runExpiryLoop() {
 
 			// Set some metrics
 			metrics.IncrCounter([]string{"consul", "cache", "evict_expired"}, 1)
+			metrics.IncrCounter([]string{"cache", "evict_expired"}, 1)
 			metrics.SetGauge([]string{"consul", "cache", "entries_count"}, float32(len(c.entries)))
+			metrics.SetGauge([]string{"cache", "entries_count"}, float32(len(c.entries)))
 
 			c.entriesLock.Unlock()
 		}

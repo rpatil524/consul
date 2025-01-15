@@ -1,16 +1,18 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package proxycfgglue
 
 import (
 	"context"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/hashicorp/consul/agent/consul/state"
 	"github.com/hashicorp/consul/agent/proxycfg"
 	"github.com/hashicorp/consul/agent/structs"
-	"github.com/hashicorp/consul/proto/pbpeering"
+	"github.com/hashicorp/consul/proto/private/pbpeering"
 	"github.com/hashicorp/consul/sdk/testutil"
+	"github.com/stretchr/testify/require"
 )
 
 func TestServerExportedPeeredServices(t *testing.T) {
@@ -20,12 +22,15 @@ func TestServerExportedPeeredServices(t *testing.T) {
 	t.Cleanup(cancel)
 
 	store := state.NewStateStore(nil)
+	require.NoError(t, store.CASetConfig(0, &structs.CAConfiguration{ClusterID: "cluster-id"}))
 
 	for _, peer := range []string{"peer-1", "peer-2", "peer-3"} {
-		require.NoError(t, store.PeeringWrite(nextIndex(), &pbpeering.Peering{
-			ID:    testUUID(t),
-			Name:  peer,
-			State: pbpeering.PeeringState_ACTIVE,
+		require.NoError(t, store.PeeringWrite(nextIndex(), &pbpeering.PeeringWriteRequest{
+			Peering: &pbpeering.Peering{
+				ID:    testUUID(t),
+				Name:  peer,
+				State: pbpeering.PeeringState_ACTIVE,
+			},
 		}))
 	}
 
@@ -35,17 +40,25 @@ func TestServerExportedPeeredServices(t *testing.T) {
 			{
 				Name: "web",
 				Consumers: []structs.ServiceConsumer{
-					{PeerName: "peer-1"},
+					{Peer: "peer-1"},
 				},
 			},
 			{
 				Name: "db",
 				Consumers: []structs.ServiceConsumer{
-					{PeerName: "peer-2"},
+					{Peer: "peer-2"},
 				},
 			},
 		},
 	}))
+
+	// Create resolvers for each of the services so that they are guaranteed to be replicated by the peer stream.
+	for _, s := range []string{"web", "api", "db"} {
+		require.NoError(t, store.EnsureConfigEntry(0, &structs.ServiceResolverConfigEntry{
+			Kind: structs.ServiceResolver,
+			Name: s,
+		}))
+	}
 
 	authz := policyAuthorizer(t, `
 		service "web" { policy = "read" }
@@ -58,7 +71,7 @@ func TestServerExportedPeeredServices(t *testing.T) {
 		GetStore:    func() Store { return store },
 		ACLResolver: newStaticResolver(authz),
 	})
-	require.NoError(t, dataSource.Notify(ctx, &structs.DCSpecificRequest{}, "", eventCh))
+	require.NoError(t, dataSource.Notify(ctx, &structs.DCSpecificRequest{Datacenter: "dc1"}, "", eventCh))
 
 	testutil.RunStep(t, "initial state", func(t *testing.T) {
 		result := getEventResult[*structs.IndexedExportedServiceList](t, eventCh)
@@ -77,20 +90,20 @@ func TestServerExportedPeeredServices(t *testing.T) {
 				{
 					Name: "web",
 					Consumers: []structs.ServiceConsumer{
-						{PeerName: "peer-1"},
+						{Peer: "peer-1"},
 					},
 				},
 				{
 					Name: "db",
 					Consumers: []structs.ServiceConsumer{
-						{PeerName: "peer-2"},
+						{Peer: "peer-2"},
 					},
 				},
 				{
 					Name: "api",
 					Consumers: []structs.ServiceConsumer{
-						{PeerName: "peer-1"},
-						{PeerName: "peer-3"},
+						{Peer: "peer-1"},
+						{Peer: "peer-3"},
 					},
 				},
 			},

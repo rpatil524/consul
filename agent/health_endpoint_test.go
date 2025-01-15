@@ -1,20 +1,24 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/armon/go-metrics"
-	"github.com/hashicorp/serf/coordinate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/hashicorp/serf/coordinate"
 
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
@@ -98,7 +102,7 @@ func TestHealthChecksInState_NodeMetaFilter(t *testing.T) {
 		},
 	}
 	var out struct{}
-	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+	if err := a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -142,7 +146,7 @@ func TestHealthChecksInState_Filter(t *testing.T) {
 		},
 	}
 	var out struct{}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	args = &structs.RegisterRequest{
 		Datacenter: "dc1",
@@ -156,7 +160,7 @@ func TestHealthChecksInState_Filter(t *testing.T) {
 		},
 		SkipNodeUpdate: true,
 	}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	req, _ := http.NewRequest("GET", "/v1/health/state/critical?filter="+url.QueryEscape("Name == `node check 2`"), nil)
 	retry.Run(t, func(r *retry.R) {
@@ -192,12 +196,12 @@ func TestHealthChecksInState_DistanceSort(t *testing.T) {
 	}
 
 	var out struct{}
-	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+	if err := a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	args.Node, args.Check.Node = "foo", "foo"
-	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+	if err := a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -225,7 +229,7 @@ func TestHealthChecksInState_DistanceSort(t *testing.T) {
 		Node:       "foo",
 		Coord:      coordinate.NewCoordinate(coordinate.DefaultConfig()),
 	}
-	if err := a.RPC("Coordinate.Update", &arg, &out); err != nil {
+	if err := a.RPC(context.Background(), "Coordinate.Update", &arg, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	// Retry until foo moves to the front of the line.
@@ -235,7 +239,7 @@ func TestHealthChecksInState_DistanceSort(t *testing.T) {
 		if err != nil {
 			r.Fatalf("err: %v", err)
 		}
-		assertIndex(t, resp)
+		assertIndex(r, resp)
 		nodes = obj.(structs.HealthChecks)
 		if len(nodes) != 2 {
 			r.Fatalf("bad: %v", nodes)
@@ -310,7 +314,7 @@ func TestHealthNodeChecks_Filtering(t *testing.T) {
 	}
 
 	var out struct{}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	// Create a second check
 	args = &structs.RegisterRequest{
@@ -323,7 +327,7 @@ func TestHealthNodeChecks_Filtering(t *testing.T) {
 		},
 		SkipNodeUpdate: true,
 	}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	req, _ := http.NewRequest("GET", "/v1/health/node/test-health-node?filter="+url.QueryEscape("Name == check2"), nil)
 	resp := httptest.NewRecorder()
@@ -374,7 +378,7 @@ func TestHealthServiceChecks(t *testing.T) {
 	}
 
 	var out struct{}
-	if err = a.RPC("Catalog.Register", args, &out); err != nil {
+	if err = a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -434,23 +438,25 @@ func TestHealthServiceChecks_NodeMetaFilter(t *testing.T) {
 	}
 
 	var out struct{}
-	if err = a.RPC("Catalog.Register", args, &out); err != nil {
+	if err = a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	req, _ = http.NewRequest("GET", "/v1/health/checks/consul?dc=dc1&node-meta=somekey:somevalue", nil)
-	resp = httptest.NewRecorder()
-	obj, err = a.srv.HealthServiceChecks(resp, req)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	assertIndex(t, resp)
+	retry.Run(t, func(r *retry.R) {
+		req, _ = http.NewRequest("GET", "/v1/health/checks/consul?dc=dc1&node-meta=somekey:somevalue", nil)
+		resp = httptest.NewRecorder()
+		obj, err = a.srv.HealthServiceChecks(resp, req)
+		if err != nil {
+			r.Fatalf("err: %v", err)
+		}
+		assertIndex(r, resp)
 
-	// Should be 1 health check for consul
-	nodes = obj.(structs.HealthChecks)
-	if len(nodes) != 1 {
-		t.Fatalf("bad: %v", obj)
-	}
+		// Should be 1 health check for consul
+		nodes = obj.(structs.HealthChecks)
+		if len(nodes) != 1 {
+			r.Fatalf("bad: %v", obj)
+		}
+	})
 }
 
 func TestHealthServiceChecks_Filtering(t *testing.T) {
@@ -487,7 +493,7 @@ func TestHealthServiceChecks_Filtering(t *testing.T) {
 	}
 
 	var out struct{}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	// Create a new node, service and check
 	args = &structs.RegisterRequest{
@@ -505,7 +511,7 @@ func TestHealthServiceChecks_Filtering(t *testing.T) {
 			ServiceID: "consul",
 		},
 	}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	req, _ = http.NewRequest("GET", "/v1/health/checks/consul?dc=dc1&filter="+url.QueryEscape("Node == `test-health-node`"), nil)
 	resp = httptest.NewRecorder()
@@ -545,12 +551,12 @@ func TestHealthServiceChecks_DistanceSort(t *testing.T) {
 	}
 
 	var out struct{}
-	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+	if err := a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	args.Node, args.Check.Node = "foo", "foo"
-	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+	if err := a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -578,7 +584,7 @@ func TestHealthServiceChecks_DistanceSort(t *testing.T) {
 		Node:       "foo",
 		Coord:      coordinate.NewCoordinate(coordinate.DefaultConfig()),
 	}
-	if err := a.RPC("Coordinate.Update", &arg, &out); err != nil {
+	if err := a.RPC(context.Background(), "Coordinate.Update", &arg, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	// Retry until foo has moved to the front of the line.
@@ -588,7 +594,7 @@ func TestHealthServiceChecks_DistanceSort(t *testing.T) {
 		if err != nil {
 			r.Fatalf("err: %v", err)
 		}
-		assertIndex(t, resp)
+		assertIndex(r, resp)
 		nodes = obj.(structs.HealthChecks)
 		if len(nodes) != 2 {
 			r.Fatalf("bad: %v", obj)
@@ -602,13 +608,56 @@ func TestHealthServiceChecks_DistanceSort(t *testing.T) {
 	})
 }
 
+type queryBackendConfiguration struct {
+	name         string
+	config       string
+	cached       bool
+	queryBackend string
+}
+
+var queryBackendConfigs = []*queryBackendConfiguration{
+	{
+		name:         "blocking-query-without-cache",
+		config:       `use_streaming_backend=false`,
+		cached:       false,
+		queryBackend: "blocking-query",
+	},
+	{
+		name:         "blocking-query-with-cache",
+		config:       `use_streaming_backend=false`,
+		cached:       true,
+		queryBackend: "blocking-query",
+	},
+	{
+		name: "streaming-with-cache-setting",
+		config: `
+			rpc{
+				enable_streaming=true
+			}
+			use_streaming_backend=true
+		    `,
+		cached:       true,
+		queryBackend: "streaming",
+	},
+}
+
 func TestHealthServiceNodes(t *testing.T) {
+	for _, cfg := range queryBackendConfigs {
+		t.Run(cfg.name, func(t *testing.T) {
+			testHealthServiceNodes(t, cfg)
+		})
+	}
+}
+
+func testHealthServiceNodes(t *testing.T, backendCfg *queryBackendConfiguration) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 
 	t.Parallel()
-	a := NewTestAgent(t, "")
+	a := StartTestAgent(t, TestAgent{HCL: backendCfg.config, Overrides: `peering = { test_allow_peer_registrations = true }`})
+	defer a.Shutdown()
+
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	testingPeerNames := []string{"", "my-peer"}
@@ -661,7 +710,7 @@ func TestHealthServiceNodes(t *testing.T) {
 		}
 
 		var out struct{}
-		require.NoError(t, a.RPC("Catalog.Register", args, &out))
+		require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 		originalRegister[peerName] = args
 	}
 
@@ -691,30 +740,44 @@ func TestHealthServiceNodes(t *testing.T) {
 		// Test caching
 		{
 			// List instances with cache enabled
-			req, err := http.NewRequest("GET", "/v1/health/service/test?cached"+peerQuerySuffix(peerName), nil)
+			req, err := http.NewRequest("GET", "/v1/health/service/test?"+peerQuerySuffix(peerName), nil)
 			require.NoError(t, err)
+			if backendCfg.cached {
+				addQueryParam(req, "cached", "true")
+			}
 			resp := httptest.NewRecorder()
 			obj, err := a.srv.HealthServiceNodes(resp, req)
 			require.NoError(t, err)
 			nodes := obj.(structs.CheckServiceNodes)
 			verify(t, peerName, nodes)
 
-			// Should be a cache miss
-			require.Equal(t, "MISS", resp.Header().Get("X-Cache"))
+			if backendCfg.cached {
+				// Should be a cache miss
+				require.Equal(t, "MISS", resp.Header().Get("X-Cache"))
+			}
+
+			require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 		}
 
 		{
 			// List instances with cache enabled
-			req, err := http.NewRequest("GET", "/v1/health/service/test?cached"+peerQuerySuffix(peerName), nil)
+			req, err := http.NewRequest("GET", "/v1/health/service/test?"+peerQuerySuffix(peerName), nil)
 			require.NoError(t, err)
+			if backendCfg.cached {
+				addQueryParam(req, "cached", "true")
+			}
 			resp := httptest.NewRecorder()
 			obj, err := a.srv.HealthServiceNodes(resp, req)
 			require.NoError(t, err)
 			nodes := obj.(structs.CheckServiceNodes)
 			verify(t, peerName, nodes)
 
-			// Should be a cache HIT now!
-			require.Equal(t, "HIT", resp.Header().Get("X-Cache"))
+			if backendCfg.cached {
+				// Should be a cache HIT now!
+				require.Equal(t, "HIT", resp.Header().Get("X-Cache"))
+			}
+
+			require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 		}
 	}
 
@@ -728,14 +791,17 @@ func TestHealthServiceNodes(t *testing.T) {
 			args2.Node = "baz"
 			args2.Address = "127.0.0.2"
 			var out struct{}
-			require.NoError(t, a.RPC("Catalog.Register", &args2, &out))
+			require.NoError(t, a.RPC(context.Background(), "Catalog.Register", &args2, &out))
 		}
 
 		for _, peerName := range testingPeerNames {
 			retry.Run(t, func(r *retry.R) {
 				// List it again
-				req, err := http.NewRequest("GET", "/v1/health/service/test?cached"+peerQuerySuffix(peerName), nil)
+				req, err := http.NewRequest("GET", "/v1/health/service/test?"+peerQuerySuffix(peerName), nil)
 				require.NoError(r, err)
+				if backendCfg.cached {
+					addQueryParam(req, "cached", "true")
+				}
 				resp := httptest.NewRecorder()
 				obj, err := a.srv.HealthServiceNodes(resp, req)
 				require.NoError(r, err)
@@ -750,12 +816,15 @@ func TestHealthServiceNodes(t *testing.T) {
 				_, err = strconv.ParseUint(header, 10, 64)
 				require.NoError(r, err)
 
-				// Should be a cache hit! The data should've updated in the cache
-				// in the background so this should've been fetched directly from
-				// the cache.
-				if resp.Header().Get("X-Cache") != "HIT" {
-					r.Fatalf("should be a cache hit")
+				if backendCfg.cached {
+					// Should be a cache hit! The data should've updated in the cache
+					// in the background so this should've been fetched directly from
+					// the cache.
+					if resp.Header().Get("X-Cache") != "HIT" {
+						r.Fatalf("should be a cache hit")
+					}
 				}
+				require.Equal(r, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 			})
 		}
 	}
@@ -817,8 +886,9 @@ use_streaming_backend = true
 				AllowedPrefixes: []string{"testing.grpc."},
 			}, sink)
 
-			a := NewTestAgent(t, tc.hcl)
+			a := StartTestAgent(t, TestAgent{HCL: tc.hcl, Overrides: `peering = { test_allow_peer_registrations = true }`})
 			defer a.Shutdown()
+
 			testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 			// Register some initial service instances
@@ -837,7 +907,7 @@ use_streaming_backend = true
 				}
 
 				var out struct{}
-				require.NoError(t, a.RPC("Catalog.Register", args, &out))
+				require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 			}
 
 			// Initial request should return two instances
@@ -891,7 +961,7 @@ use_streaming_backend = true
 				}
 
 				var out struct{}
-				errCh <- a.RPC("Catalog.Register", args, &out)
+				errCh <- a.RPC(context.Background(), "Catalog.Register", args, &out)
 			}()
 
 			{
@@ -1007,14 +1077,15 @@ use_streaming_backend = true
 		}
 
 		var out struct{}
-		require.NoError(t, a.RPC("Catalog.Register", args, &out))
+		require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 	}
 
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			a := NewTestAgent(t, tc.hcl)
+			a := StartTestAgent(t, TestAgent{HCL: tc.hcl, Overrides: `peering = { test_allow_peer_registrations = true }`})
 			defer a.Shutdown()
+
 			testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 			// Register one with a tag.
@@ -1124,87 +1195,104 @@ func TestHealthServiceNodes_NodeMetaFilter(t *testing.T) {
 	}
 	for _, tst := range tests {
 		t.Run(tst.name, func(t *testing.T) {
-
 			a := NewTestAgent(t, tst.config)
-			defer a.Shutdown()
 			testrpc.WaitForLeader(t, a.RPC, "dc1")
+			testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+			waitForStreamingToBeReady(t, a)
 
-			req, _ := http.NewRequest("GET", "/v1/health/service/consul?dc=dc1&node-meta=somekey:somevalue", nil)
-			resp := httptest.NewRecorder()
-			obj, err := a.srv.HealthServiceNodes(resp, req)
-			if err != nil {
-				t.Fatalf("err: %v", err)
-			}
+			encodedMeta := url.QueryEscape("somekey:somevalue")
 
-			assertIndex(t, resp)
+			var lastIndex uint64
+			testutil.RunStep(t, "do initial read", func(t *testing.T) {
+				u := fmt.Sprintf("/v1/health/service/test?dc=dc1&node-meta=%s", encodedMeta)
 
-			cIndex, err := strconv.ParseUint(resp.Header().Get("X-Consul-Index"), 10, 64)
-			require.NoError(t, err)
+				req, err := http.NewRequest("GET", u, nil)
+				require.NoError(t, err)
+				resp := httptest.NewRecorder()
+				obj, err := a.srv.HealthServiceNodes(resp, req)
+				require.NoError(t, err)
 
-			// Should be a non-nil empty list
-			nodes := obj.(structs.CheckServiceNodes)
-			if nodes == nil || len(nodes) != 0 {
-				t.Fatalf("bad: %v", obj)
-			}
+				lastIndex = getIndex(t, resp)
+				require.True(t, lastIndex > 0)
 
-			args := &structs.RegisterRequest{
-				Datacenter: "dc1",
-				Node:       "bar",
-				Address:    "127.0.0.1",
-				NodeMeta:   map[string]string{"somekey": "somevalue"},
-				Service: &structs.NodeService{
-					ID:      "test",
-					Service: "test",
-				},
-			}
+				// Should be a non-nil empty list
+				nodes := obj.(structs.CheckServiceNodes)
+				require.NotNil(t, nodes)
+				require.Empty(t, nodes)
+			})
 
-			var out struct{}
-			if err := a.RPC("Catalog.Register", args, &out); err != nil {
-				t.Fatalf("err: %v", err)
-			}
+			require.True(t, lastIndex > 0, "lastindex = %d", lastIndex)
 
-			args = &structs.RegisterRequest{
-				Datacenter: "dc1",
-				Node:       "bar2",
-				Address:    "127.0.0.1",
-				NodeMeta:   map[string]string{"somekey": "othervalue"},
-				Service: &structs.NodeService{
-					ID:      "test2",
-					Service: "test",
-				},
-			}
+			testutil.RunStep(t, "register item 1", func(t *testing.T) {
+				args := &structs.RegisterRequest{
+					Datacenter: "dc1",
+					Node:       "bar",
+					Address:    "127.0.0.1",
+					NodeMeta:   map[string]string{"somekey": "somevalue"},
+					Service: &structs.NodeService{
+						ID:      "test",
+						Service: "test",
+					},
+				}
 
-			if err := a.RPC("Catalog.Register", args, &out); err != nil {
-				t.Fatalf("err: %v", err)
-			}
+				var ignored struct{}
+				require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &ignored))
+			})
 
-			req, _ = http.NewRequest("GET", fmt.Sprintf("/v1/health/service/test?dc=dc1&node-meta=somekey:somevalue&index=%d&wait=10ms", cIndex), nil)
-			resp = httptest.NewRecorder()
-			obj, err = a.srv.HealthServiceNodes(resp, req)
-			if err != nil {
-				t.Fatalf("err: %v", err)
-			}
+			testutil.RunStep(t, "register item 2", func(t *testing.T) {
+				args := &structs.RegisterRequest{
+					Datacenter: "dc1",
+					Node:       "bar2",
+					Address:    "127.0.0.1",
+					NodeMeta:   map[string]string{"somekey": "othervalue"},
+					Service: &structs.NodeService{
+						ID:      "test2",
+						Service: "test",
+					},
+				}
+				var ignored struct{}
+				require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &ignored))
+			})
 
-			assertIndex(t, resp)
+			testutil.RunStep(t, "do blocking read", func(t *testing.T) {
+				u := fmt.Sprintf("/v1/health/service/test?dc=dc1&node-meta=%s&index=%d&wait=100ms&cached", encodedMeta, lastIndex)
 
-			// Should be a non-nil empty list for checks
-			nodes = obj.(structs.CheckServiceNodes)
-			if len(nodes) != 1 || nodes[0].Checks == nil || len(nodes[0].Checks) != 0 {
-				t.Fatalf("bad: %v", obj)
-			}
+				req, err := http.NewRequest("GET", u, nil)
+				require.NoError(t, err)
+				resp := httptest.NewRecorder()
+				obj, err := a.srv.HealthServiceNodes(resp, req)
+				require.NoError(t, err)
 
-			require.Equal(t, tst.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
+				assertIndex(t, resp)
+				assert.Equal(t, "MISS", resp.Header().Get("X-Cache"))
+
+				// Should be a non-nil empty list for checks
+				nodes := obj.(structs.CheckServiceNodes)
+				require.Len(t, nodes, 1)
+				require.NotNil(t, nodes[0].Checks)
+				require.Empty(t, nodes[0].Checks)
+
+				require.Equal(t, tst.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
+			})
 		})
 	}
 }
 
 func TestHealthServiceNodes_Filter(t *testing.T) {
+	for _, cfg := range queryBackendConfigs {
+		t.Run(cfg.name, func(t *testing.T) {
+			testHealthServiceNodes_Filter(t, cfg)
+		})
+	}
+}
+
+func testHealthServiceNodes_Filter(t *testing.T, backendCfg *queryBackendConfiguration) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 
 	t.Parallel()
-	a := NewTestAgent(t, "")
+	a := NewTestAgent(t, backendCfg.config)
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -1231,7 +1319,7 @@ func TestHealthServiceNodes_Filter(t *testing.T) {
 	}
 
 	var out struct{}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	// Create a new node, service and check
 	args = &structs.RegisterRequest{
@@ -1249,9 +1337,12 @@ func TestHealthServiceNodes_Filter(t *testing.T) {
 			ServiceID: "consul",
 		},
 	}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	req, _ = http.NewRequest("GET", "/v1/health/service/consul?dc=dc1&filter="+url.QueryEscape("Node.Node == `test-health-node`"), nil)
+	if backendCfg.cached {
+		addQueryParam(req, "cached", "true")
+	}
 	resp = httptest.NewRecorder()
 	obj, err = a.srv.HealthServiceNodes(resp, req)
 	require.NoError(t, err)
@@ -1262,6 +1353,8 @@ func TestHealthServiceNodes_Filter(t *testing.T) {
 	nodes = obj.(structs.CheckServiceNodes)
 	require.Len(t, nodes, 1)
 	require.Len(t, nodes[0].Checks, 1)
+
+	require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 }
 
 func TestHealthServiceNodes_DistanceSort(t *testing.T) {
@@ -1290,12 +1383,12 @@ func TestHealthServiceNodes_DistanceSort(t *testing.T) {
 	}
 	testrpc.WaitForLeader(t, a.RPC, dc)
 	var out struct{}
-	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+	if err := a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	args.Node, args.Check.Node = "foo", "foo"
-	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+	if err := a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -1323,7 +1416,7 @@ func TestHealthServiceNodes_DistanceSort(t *testing.T) {
 		Node:       "foo",
 		Coord:      coordinate.NewCoordinate(coordinate.DefaultConfig()),
 	}
-	if err := a.RPC("Coordinate.Update", &arg, &out); err != nil {
+	if err := a.RPC(context.Background(), "Coordinate.Update", &arg, &out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	// Retry until foo has moved to the front of the line.
@@ -1333,7 +1426,7 @@ func TestHealthServiceNodes_DistanceSort(t *testing.T) {
 		if err != nil {
 			r.Fatalf("err: %v", err)
 		}
-		assertIndex(t, resp)
+		assertIndex(r, resp)
 		nodes = obj.(structs.CheckServiceNodes)
 		if len(nodes) != 2 {
 			r.Fatalf("bad: %v", obj)
@@ -1348,12 +1441,20 @@ func TestHealthServiceNodes_DistanceSort(t *testing.T) {
 }
 
 func TestHealthServiceNodes_PassingFilter(t *testing.T) {
+	for _, cfg := range queryBackendConfigs {
+		t.Run(cfg.name, func(t *testing.T) {
+			testHealthServiceNodes_PassingFilter(t, cfg)
+		})
+	}
+}
+
+func testHealthServiceNodes_PassingFilter(t *testing.T, backendCfg *queryBackendConfiguration) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 
 	t.Parallel()
-	a := NewTestAgent(t, "")
+	a := NewTestAgent(t, backendCfg.config)
 	defer a.Shutdown()
 
 	dc := "dc1"
@@ -1372,13 +1473,16 @@ func TestHealthServiceNodes_PassingFilter(t *testing.T) {
 
 	retry.Run(t, func(r *retry.R) {
 		var out struct{}
-		if err := a.RPC("Catalog.Register", args, &out); err != nil {
+		if err := a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
 			r.Fatalf("err: %v", err)
 		}
 	})
 
 	t.Run("bc_no_query_value", func(t *testing.T) {
 		req, _ := http.NewRequest("GET", "/v1/health/service/consul?passing", nil)
+		if backendCfg.cached {
+			addQueryParam(req, "cached", "")
+		}
 		resp := httptest.NewRecorder()
 		obj, err := a.srv.HealthServiceNodes(resp, req)
 		if err != nil {
@@ -1390,12 +1494,16 @@ func TestHealthServiceNodes_PassingFilter(t *testing.T) {
 		// Should be 0 health check for consul
 		nodes := obj.(structs.CheckServiceNodes)
 		if len(nodes) != 0 {
-			t.Fatalf("bad: %v", obj)
+			t.Fatalf("bad: %v", nodes)
 		}
+		require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 	})
 
 	t.Run("passing_true", func(t *testing.T) {
 		req, _ := http.NewRequest("GET", "/v1/health/service/consul?passing=true", nil)
+		if backendCfg.cached {
+			addQueryParam(req, "cached", "")
+		}
 		resp := httptest.NewRecorder()
 		obj, err := a.srv.HealthServiceNodes(resp, req)
 		if err != nil {
@@ -1409,10 +1517,14 @@ func TestHealthServiceNodes_PassingFilter(t *testing.T) {
 		if len(nodes) != 0 {
 			t.Fatalf("bad: %v", obj)
 		}
+		require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 	})
 
 	t.Run("passing_false", func(t *testing.T) {
 		req, _ := http.NewRequest("GET", "/v1/health/service/consul?passing=false", nil)
+		if backendCfg.cached {
+			addQueryParam(req, "cached", "")
+		}
 		resp := httptest.NewRecorder()
 		obj, err := a.srv.HealthServiceNodes(resp, req)
 		if err != nil {
@@ -1427,16 +1539,21 @@ func TestHealthServiceNodes_PassingFilter(t *testing.T) {
 		if len(nodes) != 1 {
 			t.Fatalf("bad: %v", obj)
 		}
+		require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 	})
 
 	t.Run("passing_bad", func(t *testing.T) {
 		req, _ := http.NewRequest("GET", "/v1/health/service/consul?passing=nope-nope-nope", nil)
+		if backendCfg.cached {
+			addQueryParam(req, "cached", "")
+		}
 		resp := httptest.NewRecorder()
 		_, err := a.srv.HealthServiceNodes(resp, req)
 		require.True(t, isHTTPBadRequest(err), fmt.Sprintf("Expected bad request HTTP error but got %v", err))
 		if !strings.Contains(err.Error(), "Invalid value for ?passing") {
 			t.Errorf("bad %s", err.Error())
 		}
+		require.Equal(t, "", resp.Header().Get("X-Consul-Query-Backend"))
 	})
 }
 
@@ -1476,7 +1593,7 @@ func TestHealthServiceNodes_CheckType(t *testing.T) {
 	}
 
 	var out struct{}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	req, _ = http.NewRequest("GET", "/v1/health/service/consul?dc=dc1", nil)
 	resp = httptest.NewRecorder()
@@ -1548,7 +1665,7 @@ func TestHealthServiceNodes_WanTranslation(t *testing.T) {
 		}
 
 		var out struct{}
-		require.NoError(t, a2.RPC("Catalog.Register", args, &out))
+		require.NoError(t, a2.RPC(context.Background(), "Catalog.Register", args, &out))
 	}
 
 	// Query for a service in DC2 from DC1.
@@ -1588,23 +1705,34 @@ func TestHealthServiceNodes_WanTranslation(t *testing.T) {
 }
 
 func TestHealthConnectServiceNodes(t *testing.T) {
+	for _, cfg := range queryBackendConfigs {
+		t.Run(cfg.name, func(t *testing.T) {
+			testHealthConnectServiceNodes(t, cfg)
+		})
+	}
+}
+
+func testHealthConnectServiceNodes(t *testing.T, backendCfg *queryBackendConfiguration) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 
 	t.Parallel()
 
-	a := NewTestAgent(t, "")
+	a := NewTestAgent(t, backendCfg.config)
 	defer a.Shutdown()
 
 	// Register
 	args := structs.TestRegisterRequestProxy(t)
 	var out struct{}
-	assert.Nil(t, a.RPC("Catalog.Register", args, &out))
+	assert.Nil(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	// Request
 	req, _ := http.NewRequest("GET", fmt.Sprintf(
 		"/v1/health/connect/%s?dc=dc1", args.Service.Proxy.DestinationServiceName), nil)
+	if backendCfg.cached {
+		addQueryParam(req, "cached", "true")
+	}
 	resp := httptest.NewRecorder()
 	obj, err := a.srv.HealthConnectServiceNodes(resp, req)
 	assert.Nil(t, err)
@@ -1614,6 +1742,8 @@ func TestHealthConnectServiceNodes(t *testing.T) {
 	nodes := obj.(structs.CheckServiceNodes)
 	assert.Len(t, nodes, 1)
 	assert.Len(t, nodes[0].Checks, 0)
+
+	require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 }
 
 func TestHealthIngressServiceNodes(t *testing.T) {
@@ -1633,15 +1763,16 @@ func testHealthIngressServiceNodes(t *testing.T, agentHCL string) {
 	a := NewTestAgent(t, agentHCL)
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
+	waitForStreamingToBeReady(t, a)
 
 	// Register gateway
 	gatewayArgs := structs.TestRegisterIngressGateway(t)
 	gatewayArgs.Service.Address = "127.0.0.27"
 	var out struct{}
-	require.NoError(t, a.RPC("Catalog.Register", gatewayArgs, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", gatewayArgs, &out))
 
 	args := structs.TestRegisterRequest(t)
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	// Associate service to gateway
 	cfgArgs := &structs.IngressGatewayConfigEntry{
@@ -1664,7 +1795,7 @@ func testHealthIngressServiceNodes(t *testing.T, agentHCL string) {
 		Entry:      cfgArgs,
 	}
 	var outB bool
-	require.Nil(t, a.RPC("ConfigEntry.Apply", req, &outB))
+	require.Nil(t, a.RPC(context.Background(), "ConfigEntry.Apply", req, &outB))
 	require.True(t, outB)
 
 	checkResults := func(t *testing.T, obj interface{}) {
@@ -1732,13 +1863,21 @@ func testHealthIngressServiceNodes(t *testing.T, agentHCL string) {
 }
 
 func TestHealthConnectServiceNodes_Filter(t *testing.T) {
+	for _, cfg := range queryBackendConfigs {
+		t.Run(cfg.name, func(t *testing.T) {
+			testHealthConnectServiceNodes_Filter(t, cfg)
+		})
+	}
+}
+
+func testHealthConnectServiceNodes_Filter(t *testing.T, backendCfg *queryBackendConfiguration) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 
 	t.Parallel()
 
-	a := NewTestAgent(t, "")
+	a := NewTestAgent(t, backendCfg.config)
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -1746,21 +1885,30 @@ func TestHealthConnectServiceNodes_Filter(t *testing.T) {
 	args := structs.TestRegisterRequestProxy(t)
 	args.Service.Address = "127.0.0.55"
 	var out struct{}
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	args = structs.TestRegisterRequestProxy(t)
+	// when using streaming these come back as empty slices rather than nil.
+	// rather than changing structs.TestRegisterRequestProxy(t) and the many places
+	// it is referenced without using caching, we'll just set them to empty slices here.
+	args.Service.Proxy.EnvoyExtensions = []structs.EnvoyExtension{}
+	args.Service.Proxy.Expose.Paths = []structs.ExposePath{}
+
 	args.Service.Address = "127.0.0.55"
 	args.Service.Meta = map[string]string{
 		"version": "2",
 	}
 	args.Service.ID = "web-proxy2"
 	args.SkipNodeUpdate = true
-	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+	require.NoError(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	req, _ := http.NewRequest("GET", fmt.Sprintf(
 		"/v1/health/connect/%s?filter=%s",
 		args.Service.Proxy.DestinationServiceName,
 		url.QueryEscape("Service.Meta.version == 2")), nil)
+	if backendCfg.cached {
+		addQueryParam(req, "cached", "true")
+	}
 	resp := httptest.NewRecorder()
 	obj, err := a.srv.HealthConnectServiceNodes(resp, req)
 	require.NoError(t, err)
@@ -1771,16 +1919,26 @@ func TestHealthConnectServiceNodes_Filter(t *testing.T) {
 	require.Equal(t, structs.ServiceKindConnectProxy, nodes[0].Service.Kind)
 	require.Equal(t, args.Service.Address, nodes[0].Service.Address)
 	require.Equal(t, args.Service.Proxy, nodes[0].Service.Proxy)
+
+	require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 }
 
 func TestHealthConnectServiceNodes_PassingFilter(t *testing.T) {
+	for _, cfg := range queryBackendConfigs {
+		t.Run(cfg.name, func(t *testing.T) {
+			testHealthConnectServiceNodes_PassingFilter(t, cfg)
+		})
+	}
+}
+
+func testHealthConnectServiceNodes_PassingFilter(t *testing.T, backendCfg *queryBackendConfiguration) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 
 	t.Parallel()
 
-	a := NewTestAgent(t, "")
+	a := NewTestAgent(t, backendCfg.config)
 	defer a.Shutdown()
 
 	// Register
@@ -1792,11 +1950,14 @@ func TestHealthConnectServiceNodes_PassingFilter(t *testing.T) {
 		Status:    api.HealthCritical,
 	}
 	var out struct{}
-	assert.Nil(t, a.RPC("Catalog.Register", args, &out))
+	assert.Nil(t, a.RPC(context.Background(), "Catalog.Register", args, &out))
 
 	t.Run("bc_no_query_value", func(t *testing.T) {
 		req, _ := http.NewRequest("GET", fmt.Sprintf(
 			"/v1/health/connect/%s?passing", args.Service.Proxy.DestinationServiceName), nil)
+		if backendCfg.cached {
+			addQueryParam(req, "cached", "true")
+		}
 		resp := httptest.NewRecorder()
 		obj, err := a.srv.HealthConnectServiceNodes(resp, req)
 		assert.Nil(t, err)
@@ -1805,11 +1966,16 @@ func TestHealthConnectServiceNodes_PassingFilter(t *testing.T) {
 		// Should be 0 health check for consul
 		nodes := obj.(structs.CheckServiceNodes)
 		assert.Len(t, nodes, 0)
+
+		require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 	})
 
 	t.Run("passing_true", func(t *testing.T) {
 		req, _ := http.NewRequest("GET", fmt.Sprintf(
 			"/v1/health/connect/%s?passing=true", args.Service.Proxy.DestinationServiceName), nil)
+		if backendCfg.cached {
+			addQueryParam(req, "cached", "true")
+		}
 		resp := httptest.NewRecorder()
 		obj, err := a.srv.HealthConnectServiceNodes(resp, req)
 		assert.Nil(t, err)
@@ -1818,11 +1984,16 @@ func TestHealthConnectServiceNodes_PassingFilter(t *testing.T) {
 		// Should be 0 health check for consul
 		nodes := obj.(structs.CheckServiceNodes)
 		assert.Len(t, nodes, 0)
+
+		require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 	})
 
 	t.Run("passing_false", func(t *testing.T) {
 		req, _ := http.NewRequest("GET", fmt.Sprintf(
 			"/v1/health/connect/%s?passing=false", args.Service.Proxy.DestinationServiceName), nil)
+		if backendCfg.cached {
+			addQueryParam(req, "cached", "true")
+		}
 		resp := httptest.NewRecorder()
 		obj, err := a.srv.HealthConnectServiceNodes(resp, req)
 		assert.Nil(t, err)
@@ -1831,55 +2002,23 @@ func TestHealthConnectServiceNodes_PassingFilter(t *testing.T) {
 		// Should be 1
 		nodes := obj.(structs.CheckServiceNodes)
 		assert.Len(t, nodes, 1)
+		require.Equal(t, backendCfg.queryBackend, resp.Header().Get("X-Consul-Query-Backend"))
 	})
 
 	t.Run("passing_bad", func(t *testing.T) {
 		req, _ := http.NewRequest("GET", fmt.Sprintf(
 			"/v1/health/connect/%s?passing=nope-nope", args.Service.Proxy.DestinationServiceName), nil)
+		if backendCfg.cached {
+			addQueryParam(req, "cached", "true")
+		}
 		resp := httptest.NewRecorder()
 		_, err := a.srv.HealthConnectServiceNodes(resp, req)
 		assert.NotNil(t, err)
 		assert.True(t, isHTTPBadRequest(err))
 
 		assert.True(t, strings.Contains(err.Error(), "Invalid value for ?passing"))
+		require.Equal(t, "", resp.Header().Get("X-Consul-Query-Backend"))
 	})
-}
-
-func TestFilterNonPassing(t *testing.T) {
-	t.Parallel()
-	nodes := structs.CheckServiceNodes{
-		structs.CheckServiceNode{
-			Checks: structs.HealthChecks{
-				&structs.HealthCheck{
-					Status: api.HealthCritical,
-				},
-				&structs.HealthCheck{
-					Status: api.HealthCritical,
-				},
-			},
-		},
-		structs.CheckServiceNode{
-			Checks: structs.HealthChecks{
-				&structs.HealthCheck{
-					Status: api.HealthCritical,
-				},
-				&structs.HealthCheck{
-					Status: api.HealthCritical,
-				},
-			},
-		},
-		structs.CheckServiceNode{
-			Checks: structs.HealthChecks{
-				&structs.HealthCheck{
-					Status: api.HealthPassing,
-				},
-			},
-		},
-	}
-	out := filterNonPassing(nodes)
-	if len(out) != 1 && reflect.DeepEqual(out[0], nodes[2]) {
-		t.Fatalf("bad: %v", out)
-	}
 }
 
 func TestListHealthyServiceNodes_MergeCentralConfig(t *testing.T) {
@@ -1973,7 +2112,7 @@ func TestHealthServiceNodes_MergeCentralConfigBlocking(t *testing.T) {
 		MergeCentralConfig: true,
 	}
 	var rpcResp structs.IndexedCheckServiceNodes
-	require.NoError(t, a.RPC("Health.ServiceNodes", &rpcReq, &rpcResp))
+	require.NoError(t, a.RPC(context.Background(), "Health.ServiceNodes", &rpcReq, &rpcResp))
 
 	require.Len(t, rpcResp.Nodes, 1)
 	nodeService := rpcResp.Nodes[0].Service
@@ -2033,4 +2172,10 @@ func peerQuerySuffix(peerName string) string {
 		return ""
 	}
 	return "&peer=" + peerName
+}
+
+func waitForStreamingToBeReady(t *testing.T, a *TestAgent) {
+	retry.Run(t, func(r *retry.R) {
+		require.True(r, a.rpcClientHealth.IsReadyForStreaming())
+	})
 }

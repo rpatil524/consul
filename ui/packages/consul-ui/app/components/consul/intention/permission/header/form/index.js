@@ -1,5 +1,10 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Component from '@ember/component';
-import { get, set, computed } from '@ember/object';
+import { set, computed } from '@ember/object';
 import { alias, equal, not } from '@ember/object/computed';
 import { inject as service } from '@ember/service';
 
@@ -12,10 +17,10 @@ export default Component.extend({
   change: service('change'),
   repo: service(`repository/${name}`),
 
-  onsubmit: function() {},
-  onreset: function() {},
+  onsubmit: function () {},
+  onreset: function () {},
 
-  changeset: computed('item', function() {
+  changeset: computed('item', function () {
     return this.change.changesetFor(
       name,
       this.item ||
@@ -27,39 +32,46 @@ export default Component.extend({
 
   headerTypes: alias(`schema.${name}.HeaderType.allowedValues`),
 
-  headerLabels: computed(function() {
+  headerLabels: computed(function () {
     return {
       Exact: 'Exactly Matching',
       Prefix: 'Prefixed by',
       Suffix: 'Suffixed by',
+      Contains: 'Containing',
       Regex: 'Regular Expression',
       Present: 'Is present',
     };
   }),
 
-  headerType: computed('changeset.HeaderType', 'headerTypes.firstObject', function() {
+  headerType: computed('changeset.HeaderType', 'headerTypes.firstObject', function () {
     return this.changeset.HeaderType || this.headerTypes.firstObject;
   }),
 
   headerTypeEqualsPresent: equal('headerType', 'Present'),
   shouldShowValueField: not('headerTypeEqualsPresent'),
 
+  shouldShowIgnoreCaseField: computed('headerType', function () {
+    return this.headerType !== 'Present' && this.headerType !== 'Regex';
+  }),
+
   actions: {
-    change: function(name, changeset, e) {
-      const value = typeof get(e, 'target.value') !== 'undefined' ? e.target.value : e;
+    change: function (name, changeset, e) {
+      const valueIndicator = e.target?.type === 'checkbox' ? e.target?.checked : e.target?.value;
+      const value = typeof valueIndicator !== 'undefined' ? valueIndicator : e;
       switch (name) {
         default:
           changeset.set(name, value);
       }
       changeset.validate();
     },
-    submit: function(changeset) {
-      this.headerTypes.forEach(prop => {
+    submit: function (changeset) {
+      this.headerTypes.forEach((prop) => {
         changeset.set(prop, undefined);
       });
       // Present is a boolean, whereas all other header types have a value
       const value = changeset.HeaderType === 'Present' ? true : changeset.Value;
       changeset.set(changeset.HeaderType, value);
+      changeset.set('IgnoreCase', changeset.IgnoreCase);
 
       // this will prevent the changeset from overwriting the
       // computed properties on the ED object
@@ -78,7 +90,7 @@ export default Component.extend({
         })
       );
     },
-    reset: function(changeset, e) {
+    reset: function (changeset, e) {
       changeset.rollback();
     },
   },

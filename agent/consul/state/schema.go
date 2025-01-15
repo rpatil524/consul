@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package state
 
 import (
@@ -32,6 +35,8 @@ func newDBSchema() *memdb.DBSchema {
 		nodesTableSchema,
 		peeringTableSchema,
 		peeringTrustBundlesTableSchema,
+		peeringSecretsTableSchema,
+		peeringSecretUUIDsTableSchema,
 		policiesTableSchema,
 		preparedQueriesTableSchema,
 		rolesTableSchema,

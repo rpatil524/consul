@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package deregister
 
 import (
@@ -81,7 +84,7 @@ func (c *cmd) Run(args []string) int {
 		}
 
 		if err := client.Agent().ServiceDeregister(id); err != nil {
-			c.UI.Error(fmt.Sprintf("Error registering service %q: %s",
+			c.UI.Error(fmt.Sprintf("Error deregistering service %q: %s",
 				svc.Name, err))
 			return 1
 		}
